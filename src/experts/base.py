@@ -94,6 +94,8 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
         knowledge_search_attempted = False
         knowledge_search_succeeded = False
         knowledge_search_failed = False
+        empty_search_retries = 0
+        MAX_EMPTY_SEARCH_RETRIES = 1
 
         lc_messages = (
             [SystemMessage(content=react_prompt)]
@@ -121,11 +123,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             return response, react_trace
 
         def is_knowledge_tool(tool_name: str) -> bool:
-            name = tool_name.lower()
-            return (
-                "knowledge_base" in name
-                or name.startswith("search_")
-            )
+            return "knowledge_base" in tool_name.lower()
 
         def has_usable_evidence(result) -> bool:
             if result is None:
@@ -230,8 +228,20 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                         if knowledge_tool:
                             if has_usable_evidence(result):
                                 knowledge_search_succeeded = True
-                            else:
+                                empty_search_retries = 0
+
+                            elif "[no index found" in str(result).lower():
                                 knowledge_search_failed = True
+
+                            elif not knowledge_search_succeeded:
+                                empty_search_retries += 1
+                                logger.info(
+                                    "Knowledge search returned no usable evidence for %s "
+                                    "(empty retry %s/%s)",
+                                    expert_name,
+                                    empty_search_retries,
+                                    MAX_EMPTY_SEARCH_RETRIES,
+                                )
 
                     except Exception:
                         logger.exception(
@@ -265,11 +275,22 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                     )
                 )
 
-                # Do not waste additional LLM calls after a failed search.
-                if knowledge_tool and not has_usable_evidence(result):
+                # Stop immediately when the index is unavailable or retrieval fails.
+                if knowledge_tool and knowledge_search_failed:
                     react_trace.append(step_record)
                     return planning_failure(
-                        "Knowledge search failed or returned no usable evidence"
+                        "Knowledge search failed or the index is unavailable"
+                    )
+
+                # Permit one retry after an empty search result.
+                if (
+                    knowledge_tool
+                    and not has_usable_evidence(result)
+                    and empty_search_retries > MAX_EMPTY_SEARCH_RETRIES
+                ):
+                    react_trace.append(step_record)
+                    return planning_failure(
+                        "Knowledge search retries exhausted without usable evidence"
                     )
 
             react_trace.append(step_record)
