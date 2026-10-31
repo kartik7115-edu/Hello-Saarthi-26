@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 
 MAX_REACT_STEPS = 5
 
+# Sent back to the model in place of an empty knowledge-search result, so it
+# knows a reformulated search is expected rather than giving up.
+EMPTY_SEARCH_RETRY_HINT = (
+    "No usable evidence was found for this search. Search the knowledge "
+    "base once more using different keywords."
+)
+
 def get_expert_tools(expert_name: str):
     """
     Returns the tools available to the expert.
@@ -81,8 +88,12 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             "Workflow:\n"
             "1. Search the knowledge base for the user's question.\n"
             "2. Review the retrieved evidence.\n"
-            "3. Search again only when the first search returned usable "
-            "evidence but more information is needed.\n"
+            "3. If a search returns no usable evidence, search once more "
+            "with different keywords (for example a synonym or the formal "
+            "name of the concept). Do not search more than twice for the "
+            "same missing information.\n"
+            "   If the evidence is useful but incomplete, you may search "
+            "again for the missing part.\n"
             "4. Answer using evidence from the knowledge base.\n"
         )
 
@@ -166,7 +177,10 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             if result_lower in ("[]", "()", "none", "null"):
                 return False
 
-            if any(marker in result_lower for marker in failure_markers):
+            # Failure messages are whole tool results produced by our own
+            # code, so match them only at the start. A substring match would
+            # reject real evidence such as "Quantization error: ...".
+            if result_lower.startswith(failure_markers):
                 return False
 
             return True
@@ -230,7 +244,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                                 knowledge_search_succeeded = True
                                 empty_search_retries = 0
 
-                            elif "[no index found" in str(result).lower():
+                            elif str(result).strip().lower().startswith("[no index found"):
                                 knowledge_search_failed = True
 
                             elif not knowledge_search_succeeded:
@@ -268,9 +282,19 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                     f"[Step {step}] Tool `{t_name}`: {result_str}"
                 )
 
+                tool_message_content = result_str
+                if (
+                    knowledge_tool
+                    and not knowledge_search_failed
+                    and not knowledge_search_succeeded
+                    and not has_usable_evidence(result)
+                    and empty_search_retries <= MAX_EMPTY_SEARCH_RETRIES
+                ):
+                    tool_message_content = EMPTY_SEARCH_RETRY_HINT
+
                 lc_messages.append(
                     ToolMessage(
-                        content=result_str,
+                        content=tool_message_content,
                         tool_call_id=t_id,
                     )
                 )

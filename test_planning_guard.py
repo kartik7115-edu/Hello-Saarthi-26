@@ -242,4 +242,81 @@ run_retry_test(
     expected_success=False,
 )
 
+# 7. Real evidence that happens to contain "error:" must not be rejected.
+run_test(
+    "Evidence containing 'error:'",
+    tool_result=(
+        "Quantization error: the difference between the sampled value "
+        "and its quantized representation."
+    ),
+    expect_success=True,
+)
+
+# 8. A failure message returned (not raised) by the tool must still block.
+run_test(
+    "Failure message returned as a result",
+    tool_result="Error: The tool failed. No verified result was returned.",
+)
+
+
+def run_retry_hint_test():
+    """After an empty search, the model is told to retry and the prompt allows it."""
+    from langchain_core.messages import ToolMessage
+
+    from src.experts.base import EMPTY_SEARCH_RETRY_HINT
+
+    evidence = (
+        "The Fourier transform converts a time-domain signal "
+        "into its frequency-domain representation."
+    )
+    fake_tool = FakeTool(results=[[], evidence])
+
+    def search(call_id):
+        msg = MagicMock()
+        msg.content = "Searching the knowledge base."
+        msg.tool_calls = [{
+            "name": fake_tool.name,
+            "args": {"query": "Explain Fourier Transform"},
+            "id": call_id,
+        }]
+        return msg
+
+    stop_response = MagicMock()
+    stop_response.content = "No further tool calls."
+    stop_response.tool_calls = []
+
+    fake_llm = MagicMock()
+    fake_llm.invoke.side_effect = [search("search-1"), search("search-2"), stop_response]
+
+    fake_final_response = MagicMock()
+    fake_final_response.is_knowledge_present = True
+    fake_structured_llm = MagicMock()
+    fake_structured_llm.invoke.return_value = fake_final_response
+
+    with (
+        patch("src.experts.base.get_expert_tools", return_value=[fake_tool]),
+        patch("src.experts.base.ChatOpenAI") as mock_chat,
+    ):
+        mock_chat.return_value.bind_tools.return_value = fake_llm
+        mock_chat.return_value.with_structured_output.return_value = fake_structured_llm
+        run_expert("notes_agent", "Explain Fourier Transform", mode="planning")
+
+    # run_expert passes the same (growing) message list on every call.
+    messages = fake_llm.invoke.call_args_list[-1][0][0]
+    tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+    system_prompt = messages[0].content
+
+    print("\nTest: Retry hint and retry-friendly prompt")
+    print(f"  First tool message: {tool_messages[0].content[:60]}...")
+
+    assert "different keywords" in system_prompt
+    assert "only when the first search returned usable" not in system_prompt
+    assert tool_messages[0].content == EMPTY_SEARCH_RETRY_HINT
+    assert tool_messages[1].content.startswith("The Fourier transform")
+    print("  PASS: Retry hint and retry-friendly prompt")
+
+
+# 9. The empty search is followed by an explicit retry instruction.
+run_retry_hint_test()
+
 print("\nAll planning guard tests passed.")
