@@ -1,8 +1,10 @@
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool, create_retriever_tool
+from langchain_core.tools import tool, StructuredTool
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from typing import List, Dict, Any, Tuple
 import logging
+import os
+import re
 
 from src.prompts.loader import get_prompt
 from src.tools.utilities import calculator
@@ -13,12 +15,117 @@ logger = logging.getLogger(__name__)
 
 MAX_REACT_STEPS = 5
 
+# How much of each tool result the planning agent sees. A knowledge search
+# returns up to 5 chunks of ~1000 characters; the old 1500-character limit
+# hid most of them from the model.
+MAX_TOOL_RESULT_CHARS = 6000
+
+# Ingestion records only the file name, not the page, so page numbers in
+# citations are always reported as unknown rather than invented.
+UNKNOWN_PAGE = 0
+
+SOURCE_LABEL_RE = re.compile(r"^\[Source: (.+?)\]$", re.MULTILINE)
+
+CITATION_INSTRUCTIONS = (
+    "Each excerpt is labelled [Source: <file name>]. In 'sources', cite only "
+    "those file names, exactly as written, and only for excerpts you actually "
+    "used. Copy the snippet word for word from that excerpt. Set page_number "
+    "to 0, because page numbers are not available."
+)
+
 # Sent back to the model in place of an empty knowledge-search result, so it
 # knows a reformulated search is expected rather than giving up.
 EMPTY_SEARCH_RETRY_HINT = (
     "No usable evidence was found for this search. Search the knowledge "
     "base once more using different keywords."
 )
+
+def _doc_source(doc) -> str:
+    metadata = getattr(doc, "metadata", None) or {}
+    source = os.path.basename(str(metadata.get("source") or "")).strip()
+    return source or "unknown"
+
+
+def format_documents(docs) -> str:
+    """Render retrieved documents with a [Source: file] label on each.
+
+    The model previously received only the passage text, so any file name
+    it cited was invented. Labels let it cite the real files.
+    """
+    blocks = []
+    for doc in docs or []:
+        text = getattr(doc, "page_content", None)
+        if isinstance(text, str) and text.strip():
+            blocks.append(f"[Source: {_doc_source(doc)}]\n{text.strip()}")
+    return "\n\n".join(blocks)
+
+
+def parse_labelled_evidence(text: str) -> Dict[str, str]:
+    """Map each [Source: file] label in text the model saw to its passage text."""
+    evidence: Dict[str, str] = {}
+    matches = list(SOURCE_LABEL_RE.finditer(text or ""))
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        source = match.group(1).strip()
+        passage = text[match.end():end].strip()
+        evidence[source] = f"{evidence.get(source, '')}\n{passage}".strip()
+    return evidence
+
+
+def _normalise(value) -> str:
+    return " ".join(str(value).split()).casefold()
+
+
+def _excerpt(text: str, limit: int = 200) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def finalize_response(response, evidence_text: str):
+    """Make reported sources and confidence consistent with the evidence.
+
+    * If the answer says the knowledge is not present, confidence is 0 and
+      there are no sources, whatever the model reported.
+    * Otherwise, citations to files the model was not shown are dropped,
+      snippets that do not appear in the cited file are replaced with a real
+      excerpt, page numbers are reported as unknown, and duplicates removed.
+    """
+    if not response.is_knowledge_present:
+        response.confidence_score = 0.0
+        response.sources = []
+        return response
+
+    evidence = {
+        _normalise(name): (name, passage)
+        for name, passage in parse_labelled_evidence(evidence_text).items()
+    }
+
+    kept, seen = [], set()
+    for citation in list(response.sources or []):
+        cited = os.path.basename(
+            str(getattr(citation, "source_file", "") or "").replace("\\", "/")
+        ).strip()
+        match = evidence.get(_normalise(cited))
+        if match is None:
+            logger.warning("Dropped citation to a source that was not retrieved: %r", cited)
+            continue
+
+        source_file, passage = match
+        snippet = str(getattr(citation, "snippet", "") or "").strip()
+        if not snippet or _normalise(snippet) not in _normalise(passage):
+            snippet = _excerpt(passage)
+
+        key = (source_file, snippet)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(Citation(source_file=source_file, page_number=UNKNOWN_PAGE, snippet=snippet))
+
+    response.sources = kept
+    return response
+
 
 def get_expert_tools(expert_name: str):
     """
@@ -27,10 +134,16 @@ def get_expert_tools(expert_name: str):
     tools = [calculator]
     retriever = get_retriever(expert_name)
     if retriever:
-        retriever_tool = create_retriever_tool(
-            retriever,
-            f"search_{expert_name}_knowledge_base",
-            f"Searches the knowledge base for {expert_name}. Use this when you need info from the stored documents."
+        def search(query: str) -> str:
+            return format_documents(retriever.invoke(query))
+
+        retriever_tool = StructuredTool.from_function(
+            func=search,
+            name=f"search_{expert_name}_knowledge_base",
+            description=(
+                f"Searches the knowledge base for {expert_name}. Use this when "
+                "you need info from the stored documents."
+            ),
         )
         tools.append(retriever_tool)
     else:
@@ -271,7 +384,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                         if knowledge_tool:
                             knowledge_search_failed = True
 
-                result_str = str(result)[:1500]
+                result_str = str(result)[:MAX_TOOL_RESULT_CHARS]
 
                 step_record["tools_called"].append(
                     {"name": t_name, "args": t_args}
@@ -279,7 +392,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
                 step_record["observations"].append(result_str[:300])
 
                 all_tool_outputs.append(
-                    f"[Step {step}] Tool `{t_name}`: {result_str}"
+                    f"[Step {step}] Tool `{t_name}`:\n{result_str}"
                 )
 
                 tool_message_content = result_str
@@ -337,9 +450,10 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             f"Tool outputs:\n{synthesis_context}\n\n"
             "Produce a comprehensive, well-structured answer using "
             "only facts supported by the successful knowledge-search "
-            "results. Do not invent facts or citations. Cite available "
-            "source filenames when present. If the retrieved evidence "
-            "does not answer the question, set is_knowledge_present=False."
+            "results. Do not invent facts or citations. If the retrieved "
+            "evidence does not answer the question, set "
+            "is_knowledge_present=False.\n"
+            f"{CITATION_INSTRUCTIONS}"
         )
 
         final_messages = (
@@ -358,7 +472,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
         )
 
         expert_response = structured_llm.invoke(final_messages)
-        return expert_response, react_trace
+        return finalize_response(expert_response, synthesis_context), react_trace
 
     elif mode == "rag":
         # Retrieve evidence before allowing the LLM to answer.
@@ -408,9 +522,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
         if not usable_docs:
             return retrieval_failure("No usable document text returned")
 
-        kb_context = "\n\n".join(
-            doc.page_content for doc in usable_docs
-        )
+        kb_context = format_documents(usable_docs)
 
         augmented = (
             "Answer the user's question using only the evidence "
@@ -418,7 +530,8 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             "Do not invent facts or citations. If the excerpts do not "
             "support an answer, set is_knowledge_present to False and "
             "explain that the available materials do not contain enough "
-            "information.\n\n"
+            "information.\n"
+            f"{CITATION_INSTRUCTIONS}\n\n"
             f"Retrieved excerpts:\n{kb_context}\n\n"
             f"User question: {query}"
         )
@@ -440,7 +553,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             + [HumanMessage(content=augmented)]
         )
 
-        return structured_llm.invoke(lc_messages), []
+        return finalize_response(structured_llm.invoke(lc_messages), kb_context), []
 
     else:
         # Fast mode: Direct Structured LLM call (no ReAct, no retrieval)
@@ -449,7 +562,7 @@ def run_expert(expert_name: str, query: str, mode: str = "fast", messages: List[
             + history
             + [HumanMessage(content=query)]
         )
-        return structured_llm.invoke(lc_messages), []
+        return finalize_response(structured_llm.invoke(lc_messages), ""), []
 
 from src.utils.state import AgentState
 

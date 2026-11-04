@@ -147,7 +147,7 @@ def make_recorder():
     """Build a get_retriever() replacement that logs every retrieval.
 
     Both the RAG path (retriever.invoke) and the planning path
-    (create_retriever_tool) go through get_retriever(), so wrapping it captures
+    (the labelled search tool) go through get_retriever(), so wrapping it captures
     exactly which documents each answer was based on.
     """
     from langchain_core.retrievers import BaseRetriever
