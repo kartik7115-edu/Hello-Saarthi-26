@@ -29,20 +29,37 @@ _SYSTEM = (
 )
 
 
+_JSON_BACKSLASH = re.compile(r"\\\\|\\(?=[A-Za-z]{2,})|\\(?![\\\"/bfnrtu])")
+
+
+def _latex_safe(text: str) -> str:
+    """Models write LaTeX inside JSON strings (\\int, \\frac, \\( ... \\)), which is invalid JSON.
+    Double a backslash that starts a LaTeX command or an escape JSON does not know; keep
+    existing double backslashes, \\" and \\uXXXX. qwen2.5:7b lost 18 of 30 MCQs to this."""
+    return _JSON_BACKSLASH.sub(lambda m: m.group(0) if m.group(0) == "\\\\" else "\\\\", text)
+
+
+def _loads(text: str):
+    for candidate in (text, _latex_safe(text)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _parse(raw: str) -> list[dict]:
     raw = raw or ""
     if "```" in raw:
         raw = raw.split("```", 2)[1]
         raw = raw.split("\n", 1)[1] if raw.lstrip().lower().startswith("json") else raw
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+    data = _loads(raw)
+    if data is None:
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
             return []
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError:
+        data = _loads(m.group(0))
+        if data is None:
             return []
     items = data.get("questions") if isinstance(data, dict) else data
     return items if isinstance(items, list) else []
@@ -67,6 +84,32 @@ def _valid(q: dict, labels: list[str]) -> dict | None:
     return {"question": question, "options": opts, "answer_index": ans, "explanation": explanation, "source": match}
 
 
+def _shuffle_options(q: dict, rng) -> dict:
+    """Shuffle the four options and move answer_index with the correct one. Measured 2026-11-19: every
+    model put the correct answer on option A far too often (qwen3:14b 57 %, the fine-tune 62 %), which
+    lets students guess. Only the order changes; question, options, explanation and source stay the same."""
+    order = list(range(len(q["options"])))
+    rng.shuffle(order)
+    return {**q, "options": [q["options"][i] for i in order], "answer_index": order.index(q["answer_index"])}
+
+
+def _kb_chunks(topic: str, k: int) -> list[dict]:
+    """Closest excerpts from the shared notes knowledge base (Qdrant chunks, Gemini index)."""
+    from src.knowledge_base import gemini_rag
+
+    if not gemini_rag.index_ready():
+        return []
+    try:
+        hits = gemini_rag.search(topic, k)
+    except Exception as e:  # noqa: BLE001 - quota / network
+        logger.warning("Knowledge-base search for MCQs failed: %s", e)
+        return []
+    return [
+        {"text": h.get("text") or "", "title": str(h.get("source_file") or "Notes").split("/")[-1], "page": h.get("page")}
+        for h in hits
+    ]
+
+
 def generate_mcqs(
     topic: str,
     *,
@@ -84,7 +127,11 @@ def generate_mcqs(
 
     level = level if level in LEVELS else "L1"
     n = max(1, min(int(n), 10))
-    chunks = retrieve(topic, course_id=course_id, material_title=material_title, k=max(3, min(n, 8)))[: max(3, min(n, 8))]
+    k = max(3, min(n, 8))
+    chunks = retrieve(topic, course_id=course_id, material_title=material_title, k=k)[:k]
+    if not chunks and not material_title:
+        # This course has no indexed materials yet: write from the shared notes knowledge base.
+        chunks = _kb_chunks(topic, k)
     covered, _ = coverage(topic, chunks)
     if not chunks or not covered:
         return {"topic": topic, "level": level, "questions": [], "not_covered": True, "sources": []}
@@ -94,7 +141,8 @@ def generate_mcqs(
     # the chat's Tier 1 (MCQ_MODEL, served by the Tier 1 endpoint), e.g. qwen2.5:3b on Ollama.
     # No provider JSON mode: small local models loop on it; the parser below is tolerant instead.
     extra = {"model": os.environ["MCQ_MODEL"]} if os.environ.get("MCQ_MODEL") else {}
-    llm = chat_llm(temperature=0.3, max_tokens=1600, tier=2 if level == "L3" else 1, **extra)
+    # Room for "thinking" models (Gemini 3.x) plus up to 10 questions; 1600 cut the JSON off.
+    llm = chat_llm(temperature=0.3, max_tokens=6000, tier=2 if level == "L3" else 1, **extra)
     prompt = (
         f"Course excerpts:\n{excerpts_block(chunks)}\n\n"
         f"Write {n} questions about \"{topic}\" at level {level}: {LEVELS[level]}.\n"
@@ -107,6 +155,11 @@ def generate_mcqs(
         return {"topic": topic, "level": level, "questions": [], "error": str(e), "sources": labs}
     items = _parse(raw)
     valid = [v for v in (_valid(q, labs) for q in items) if v]
+    if os.environ.get("MCQ_SHUFFLE", "1").strip().lower() not in ("0", "false", "no", "off"):
+        import random
+
+        rng = random.Random()
+        valid = [_shuffle_options(q, rng) for q in valid]
     return {
         "topic": topic,
         "level": level,

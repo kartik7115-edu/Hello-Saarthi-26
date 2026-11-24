@@ -18,6 +18,8 @@ import ProgressPage from './pages/Progress';
 import StudyMaterialPage from './pages/StudyMaterial';
 import SearchPage from './pages/Search';
 import SettingsPage from './pages/settings/Settings';
+import QAReviewPage from './pages/QAReview';
+import AskNotesPage from './pages/AskNotes';
 import { useAuthStore } from './stores/auth.store';
 import './stores/settings.store'; // Initialize settings (theme/font) on load
 
@@ -32,7 +34,7 @@ function App() {
   }, [restoreSession, clearSession]);
 
   return (
-    <BrowserRouter basename="/Saarthi_-Documentation">
+    <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
       <ToastProvider>
       <Routes>
         {/* Public Routes */}
@@ -49,14 +51,17 @@ function App() {
           <Route path="/courses/:id" element={<CourseDetailPage />} />
           <Route path="/chat" element={<StudentOnly><ChatPage /></StudentOnly>} />
           <Route path="/quiz" element={<StudentOnly><QuizPage /></StudentOnly>} />
-          <Route path="/code-lab" element={<StudentOnly><CodeLabPage /></StudentOnly>} />
+          {/* Teachers use it too: they review their students' submissions here. */}
+          <Route path="/code-lab" element={<CodeLabPage />} />
           <Route path="/videos" element={<VideosPage />} />
           <Route path="/videos/:id" element={<VideoPlayerPage />} />
           <Route path="/progress" element={<ProgressPage />} />
           <Route path="/notes" element={<Navigate to="/study-material" replace />} />
           <Route path="/study-material" element={<StudentOnly><StudyMaterialPage /></StudentOnly>} />
           <Route path="/search" element={<SearchPage />} />
+          <Route path="/ask-notes" element={<AskNotesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/qa-review" element={<QAReviewerOnly><QAReviewPage /></QAReviewerOnly>} />
         </Route>
 
         {/* Fallback */}
@@ -92,17 +97,27 @@ function JoinRedirect() {
   return <Navigate to={`/courses${search}`} replace />;
 }
 
-/** Student-only pages: teachers land on their class analytics instead. */
+/** Student-only pages: teachers land on their class analytics instead,
+ * QA reviewers land on their own dashboard instead. */
 function StudentOnly({ children }: { children: ReactElement }) {
   const role = useAuthStore((s) => s.user?.role);
   if (role === 'teacher') return <Navigate to="/progress" replace />;
+  if (role === 'qa_reviewer') return <Navigate to="/qa-review" replace />;
+  return children;
+}
+
+/** QA reviewer dashboard: restricted to qa_reviewer/admin — everyone else
+ * (student, teacher) is sent back to their own dashboard landing. */
+function QAReviewerOnly({ children }: { children: ReactElement }) {
+  const role = useAuthStore((s) => s.user?.role);
+  if (role !== 'qa_reviewer' && role !== 'admin') return <Navigate to="/dashboard" replace />;
   return children;
 }
 
 function GlobalChatbot() {
   const location = useLocation();
   const role = useAuthStore((s) => s.user?.role);
-  if (role === 'teacher') return null;
+  if (role === 'teacher' || role === 'qa_reviewer') return null;
   if (location.pathname === '/login' || location.pathname === '/signup') return null;
   return <AIChatbot />;
 }

@@ -3,12 +3,13 @@ import { NavLink, useLocation } from 'react-router-dom';
 import {
     LayoutDashboard, BookOpen, MessageSquare, Code2,
     BarChart3, Settings, ChevronLeft, ChevronRight,
-    GraduationCap, Eye, Flame, BookMarked, GripVertical
+    GraduationCap, Eye, Flame, BookMarked, GripVertical, ClipboardCheck, BookOpenCheck
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import './Sidebar.css';
 import { LogoIcon } from '../LogoIcon';
 import { useAuthStore } from '../../stores/auth.store';
+import { api, type ProgressResponse } from '../../lib/api';
 
 interface NavItem {
     path: string;
@@ -26,12 +27,19 @@ const DEFAULT_NAV_ITEMS: NavItem[] = [
     { path: '/videos', label: 'Video Library', icon: Eye },
     { path: '/progress', label: 'Analytics', icon: BarChart3 },
     { path: '/study-material', label: 'Study Materials', icon: BookMarked },
+    { path: '/ask-notes', label: 'Ask the Notes', icon: BookOpenCheck },
 ];
 
 const TEACHER_NAV_ITEMS: NavItem[] = [
     { path: '/progress', label: 'Class Analytics', icon: BarChart3 },
     { path: '/courses', label: 'My Courses', icon: BookOpen },
     { path: '/videos', label: 'Video Library', icon: Eye },
+    { path: '/code-lab', label: 'Coding Lab', icon: Code2 },
+    { path: '/ask-notes', label: 'Ask the Notes', icon: BookOpenCheck },
+];
+
+const QA_REVIEWER_NAV_ITEMS: NavItem[] = [
+    { path: '/qa-review', label: 'QA Review', icon: ClipboardCheck },
 ];
 
 const ICON_MAP: Record<string, LucideIcon> = {
@@ -43,6 +51,8 @@ const ICON_MAP: Record<string, LucideIcon> = {
     '/videos': Eye,
     '/progress': BarChart3,
     '/study-material': BookMarked,
+    '/ask-notes': BookOpenCheck,
+    '/qa-review': ClipboardCheck,
 };
 
 const STORAGE_KEY = 'saarthi-sidebar-order';
@@ -88,12 +98,23 @@ const bottomItems = [
 export default function Sidebar() {
     const [collapsed, setCollapsed] = useState(false);
     const location = useLocation();
-    const isTeacher = useAuthStore((s) => s.user?.role) === 'teacher';
-    const orderKey = isTeacher ? `${STORAGE_KEY}-teacher` : STORAGE_KEY;
+    const role = useAuthStore((s) => s.user?.role);
+    const isTeacher = role === 'teacher';
+    const isQAReviewer = role === 'qa_reviewer';
+    const orderKey = isTeacher ? `${STORAGE_KEY}-teacher` : isQAReviewer ? `${STORAGE_KEY}-qa-reviewer` : STORAGE_KEY;
+
+    // Real streak: consecutive days with a quiz, Code Lab submit or AI Tutor question.
+    const [streak, setStreak] = useState<number | null>(null);
+    useEffect(() => {
+        if (isTeacher || isQAReviewer) return;
+        api.get<ProgressResponse>('/users/me/progress')
+            .then((p) => setStreak(p.streakDays))
+            .catch(() => setStreak(null));
+    }, [isTeacher, isQAReviewer, location.pathname]);
 
     // Draggable nav items
     const [navItems, setNavItems] = useState<NavItem[]>(() =>
-        loadOrder(isTeacher ? TEACHER_NAV_ITEMS : DEFAULT_NAV_ITEMS, orderKey));
+        loadOrder(isTeacher ? TEACHER_NAV_ITEMS : isQAReviewer ? QA_REVIEWER_NAV_ITEMS : DEFAULT_NAV_ITEMS, orderKey));
     const dragIdx = useRef<number | null>(null);
     const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
@@ -195,8 +216,12 @@ export default function Sidebar() {
                         <div className="sidebar-study-card">
                             <div className="sidebar-study-icon"><Flame size={18} /></div>
                             <div>
-                                <p className="sidebar-study-title">5 Day Streak!</p>
-                                <p className="sidebar-study-sub">Keep learning daily</p>
+                                <p className="sidebar-study-title">
+                                    {streak ? `${streak} Day Streak!` : 'Start a streak'}
+                                </p>
+                                <p className="sidebar-study-sub">
+                                    {streak ? 'Keep learning daily' : 'Take a quiz or ask the tutor today'}
+                                </p>
                             </div>
                         </div>
                     )}

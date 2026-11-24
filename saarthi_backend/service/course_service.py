@@ -27,19 +27,20 @@ from saarthi_backend.model import (
     StreamItem,
     User,
 )
+from saarthi_backend.utils.exceptions import ValidationError
 
 
 # ----- Courses -----
 async def list_courses(
-    db: AsyncSession, limit: int = 100, offset: int = 0
+    db: AsyncSession, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
 ) -> tuple[list[Course], int]:
-    items = await CourseDAO.list_all(db, limit=limit, offset=offset)
-    total = await CourseDAO.count_all(db)
+    items = await CourseDAO.list_all(db, limit=limit, offset=offset, archived=archived)
+    total = await CourseDAO.count_all(db, archived=archived)
     return items, total
 
 
-async def get_course(db: AsyncSession, course_id: int) -> Course | None:
-    return await CourseDAO.get_by_id(db, course_id)
+async def get_course(db: AsyncSession, course_id: int, *, lock: bool = False) -> Course | None:
+    return await CourseDAO.get_by_id(db, course_id, lock=lock)
 
 
 async def create_course(
@@ -61,6 +62,28 @@ async def create_course(
         thumbnail_emoji=thumbnail_emoji,
         color=color,
         owner_id=owner_id,
+    )
+
+
+async def update_course(
+    db: AsyncSession,
+    course_id: int,
+    title: str | None = None,
+    code: str | None = None,
+    instructor: str | None = None,
+    description: str | None = None,
+    thumbnail_emoji: str | None = None,
+    color: str | None = None,
+) -> Course | None:
+    return await CourseDAO.update(
+        db,
+        course_id,
+        title=title,
+        code=code,
+        instructor=instructor,
+        description=description,
+        thumbnail_emoji=thumbnail_emoji,
+        color=color,
     )
 
 
@@ -136,9 +159,21 @@ async def create_assignment(
             type="assignment",
             title="New assignment",
             body=f"{a.title} (due {a.due_date})",
-            link=f"/courses/{course_id}/assignments/{a.id}",
+            # The frontend has no per-assignment route; the course page lists its assignments.
+            link=f"/courses/{course_id}",
         )
     return a
+
+
+async def notify_course_students(
+    db: AsyncSession, course_id: int, type: str, title: str, body: str
+) -> None:
+    """Notify every enrolled student about something new in the course."""
+    enrollments = await EnrollmentDAO.list_by_course(db, course_id, limit=10_000, offset=0)
+    for e in enrollments:
+        await NotificationDAO.create(
+            db, user_id=e.user_id, type=type, title=title, body=body, link=f"/courses/{course_id}"
+        )
 
 
 async def update_assignment(
@@ -290,19 +325,19 @@ async def search(
 # ----- Scoped course listing -----
 
 async def list_enrolled_courses(
-    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0
+    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
 ) -> tuple[list[Course], int]:
     """Return only courses the student is enrolled in."""
     from saarthi_backend.dao.course_dao import list_courses_for_student as _dao_fn
-    return await _dao_fn(db, user_id, limit=limit, offset=offset)
+    return await _dao_fn(db, user_id, limit=limit, offset=offset, archived=archived)
 
 
 async def list_owned_courses(
-    db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0
+    db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
 ) -> tuple[list[Course], int]:
     """Return only courses created by this teacher (owner_id match)."""
-    items = await CourseDAO.list_by_owner(db, owner_id, limit=limit, offset=offset)
-    total = await CourseDAO.count_by_owner(db, owner_id)
+    items = await CourseDAO.list_by_owner(db, owner_id, limit=limit, offset=offset, archived=archived)
+    total = await CourseDAO.count_by_owner(db, owner_id, archived=archived)
     return items, total
 
 
@@ -360,7 +395,7 @@ async def join_by_invite_code(
     if invite.email != "*" and invite.email != user_email.lower().strip():
         return None
 
-    course = await CourseDAO.get_by_id(db, invite.course_id)
+    course = await CourseDAO.get_by_id(db, invite.course_id, lock=True)
     if not course:
         return None
 
@@ -370,6 +405,8 @@ async def join_by_invite_code(
             await ClassroomInviteDAO.mark_accepted(db, invite.id)
         return existing, course
 
+    if course.archived_at:
+        raise ValidationError("This course is archived and closed to new enrollments.", details=None)
     enrollment = await EnrollmentDAO.create(db, user_id, invite.course_id)
     if not is_open_code:
         await ClassroomInviteDAO.mark_accepted(db, invite.id)

@@ -1,6 +1,6 @@
 """DAO for courses, enrollments, assignments, materials, stream. Includes search (courses, materials, videos)."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,22 +40,31 @@ async def count_pending_assignments_for_user(db: AsyncSession, user_id: int) -> 
 
 class CourseDAO:
     @staticmethod
-    async def get_by_id(db: AsyncSession, course_id: int) -> Course | None:
-        result = await db.execute(select(Course).where(Course.id == course_id))
+    async def get_by_id(db: AsyncSession, course_id: int, *, lock: bool = False) -> Course | None:
+        query = select(Course).where(Course.id == course_id)
+        if lock:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        result = await db.execute(query)
         return result.scalar_one_or_none()
 
     @staticmethod
+    def archive_filter(archived: bool | None):
+        if archived is None:
+            return ()
+        return (Course.archived_at.is_not(None) if archived else Course.archived_at.is_(None),)
+
+    @staticmethod
     async def list_all(
-        db: AsyncSession, limit: int = 100, offset: int = 0
+        db: AsyncSession, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
     ) -> list[Course]:
         result = await db.execute(
-            select(Course).order_by(Course.id).limit(limit).offset(offset)
+            select(Course).where(*CourseDAO.archive_filter(archived)).order_by(Course.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
 
     @staticmethod
-    async def count_all(db: AsyncSession) -> int:
-        r = await db.execute(select(func.count()).select_from(Course))
+    async def count_all(db: AsyncSession, *, archived: bool | None = None) -> int:
+        r = await db.execute(select(func.count()).select_from(Course).where(*CourseDAO.archive_filter(archived)))
         return r.scalar() or 0
 
     @staticmethod
@@ -84,17 +93,48 @@ class CourseDAO:
         return c
 
     @staticmethod
+    async def update(
+        db: AsyncSession,
+        course_id: int,
+        title: str | None = None,
+        code: str | None = None,
+        instructor: str | None = None,
+        description: str | None = None,
+        thumbnail_emoji: str | None = None,
+        color: str | None = None,
+    ) -> Course | None:
+        c = await CourseDAO.get_by_id(db, course_id)
+        if not c:
+            return None
+        if title is not None:
+            c.title = title
+        if code is not None:
+            c.code = code
+        if instructor is not None:
+            c.instructor = instructor
+        if description is not None:
+            c.description = description
+        if thumbnail_emoji is not None:
+            c.thumbnail_emoji = thumbnail_emoji
+        if color is not None:
+            c.color = color
+        await db.flush()
+        await db.refresh(c)
+        return c
+
+    @staticmethod
     async def list_by_owner(
-        db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0
+        db: AsyncSession, owner_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
     ) -> list[Course]:
         result = await db.execute(
-            select(Course).where(Course.owner_id == owner_id).order_by(Course.id).limit(limit).offset(offset)
+            select(Course).where(Course.owner_id == owner_id, *CourseDAO.archive_filter(archived))
+            .order_by(Course.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
 
     @staticmethod
-    async def count_by_owner(db: AsyncSession, owner_id: int) -> int:
-        r = await db.execute(select(func.count()).select_from(Course).where(Course.owner_id == owner_id))
+    async def count_by_owner(db: AsyncSession, owner_id: int, *, archived: bool | None = None) -> int:
+        r = await db.execute(select(func.count()).select_from(Course).where(Course.owner_id == owner_id, *CourseDAO.archive_filter(archived)))
         return r.scalar() or 0
 
     @staticmethod
@@ -320,8 +360,8 @@ class AssignmentSubmissionDAO:
         if sub:
             sub.status = status
             sub.submitted_at = datetime.now(timezone.utc)
-            if attachment_url is not None:
-                sub.attachment_url = attachment_url
+            # The student's current file list replaces the old one ("Mark as done" sends none).
+            sub.attachment_url = attachment_url
             await db.flush()
             await db.refresh(sub)
             return sub
@@ -330,8 +370,34 @@ class AssignmentSubmissionDAO:
             assignment_id=assignment_id,
             status=status,
             attachment_url=attachment_url,
+            submitted_at=datetime.now(timezone.utc),
         )
         db.add(sub)
+        await db.flush()
+        await db.refresh(sub)
+        return sub
+
+    @staticmethod
+    async def list_by_assignment(db: AsyncSession, assignment_id: int) -> list[AssignmentSubmission]:
+        result = await db.execute(
+            select(AssignmentSubmission).where(AssignmentSubmission.assignment_id == assignment_id)
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def set_grade(
+        db: AsyncSession, user_id: int, assignment_id: int, grade: float | None
+    ) -> AssignmentSubmission:
+        """Grade (or ungrade) a student's work. Missing work can be graded too, as in Google Classroom."""
+        sub = await AssignmentSubmissionDAO.get(db, user_id, assignment_id)
+        if not sub:
+            sub = AssignmentSubmission(user_id=user_id, assignment_id=assignment_id, status="pending")
+            db.add(sub)
+        sub.grade = grade
+        if grade is not None:
+            sub.status = "graded"
+        else:
+            sub.status = "submitted" if sub.submitted_at else "pending"
         await db.flush()
         await db.refresh(sub)
         return sub
@@ -558,19 +624,20 @@ async def search(
 # ----- Scoped course listing for students -----
 
 async def list_courses_for_student(
-    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0
+    db: AsyncSession, user_id: int, limit: int = 100, offset: int = 0, *, archived: bool | None = None,
 ) -> tuple[list[Course], int]:
     """Return only courses the student is enrolled in."""
     enrolled_subq = select(Enrollment.course_id).where(Enrollment.user_id == user_id)
+    filters = (Course.id.in_(enrolled_subq), *CourseDAO.archive_filter(archived))
     result = await db.execute(
         select(Course)
-        .where(Course.id.in_(enrolled_subq))
+        .where(*filters)
         .order_by(Course.id)
         .limit(limit)
         .offset(offset)
     )
     count_result = await db.execute(
-        select(func.count()).select_from(Course).where(Course.id.in_(enrolled_subq))
+        select(func.count()).select_from(Course).where(*filters)
     )
     return list(result.scalars().all()), count_result.scalar_one()
 
@@ -629,6 +696,30 @@ class ClassroomInviteDAO:
         if invite:
             invite.accepted = True
             await db.flush()
+
+    @staticmethod
+    async def list_pending_for_email(db: AsyncSession, email: str) -> list[ClassroomInvite]:
+        """Personal invites addressed to this email that are not accepted and not expired."""
+        result = await db.execute(
+            select(ClassroomInvite)
+            .where(
+                ClassroomInvite.email == email.lower().strip(),
+                ClassroomInvite.accepted == False,  # noqa: E712
+                ClassroomInvite.expires_at > datetime.now(timezone.utc),
+            )
+            .order_by(ClassroomInvite.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, invite_id: int) -> ClassroomInvite | None:
+        result = await db.execute(select(ClassroomInvite).where(ClassroomInvite.id == invite_id))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def delete(db: AsyncSession, invite: ClassroomInvite) -> None:
+        await db.delete(invite)
+        await db.flush()
 
     @staticmethod
     async def list_by_course(

@@ -9,8 +9,13 @@ class QuizQuestionResponse(BaseModel):
     id: str
     questionText: str
     optionsJson: str
-    correctIndex: int
+    # None when sent to a student taking the quiz; the answer is revealed only after submit.
+    correctIndex: Optional[int] = None
     sortOrder: int
+    topic: Optional[str] = None
+    difficulty: str = "recall"
+    # Like correctIndex: hidden from students until they submit.
+    explanation: Optional[str] = None
 
     class Config:
         populate_by_name = True
@@ -24,6 +29,10 @@ class QuizResponse(BaseModel):
     durationMinutes: int
     passingScore: float
     questionCount: int = 0
+    topic: Optional[str] = None
+    # The signed-in student's attempts on this quiz.
+    attemptCount: int = 0
+    bestScore: Optional[float] = None
 
     class Config:
         populate_by_name = True
@@ -33,27 +42,82 @@ class QuizDetailResponse(QuizResponse):
     questions: List[QuizQuestionResponse]
 
 
+class QuizAnswerResult(BaseModel):
+    questionId: str
+    selectedIndex: Optional[int] = None
+    correctIndex: int
+    isCorrect: bool
+    explanation: Optional[str] = None
+
+
 class QuizAttemptResponse(BaseModel):
     id: str
     quizId: str
     score: Optional[float] = None
     startedAt: str
     submittedAt: Optional[str] = None
+    # Filled only in the submit response, so the student can review their answers.
+    correctCount: Optional[int] = None
+    totalQuestions: Optional[int] = None
+    results: Optional[List[QuizAnswerResult]] = None
 
     class Config:
         populate_by_name = True
 
 
+class QuizAnswer(BaseModel):
+    questionId: str
+    selectedIndex: Optional[int] = Field(None, ge=0)
+
+
 class QuizAttemptSubmitRequest(BaseModel):
-    score: float = Field(..., ge=0, le=100)
-    answersJson: str = "[]"
+    """The server grades the attempt; any client-sent score is ignored."""
+
+    answers: List[QuizAnswer] = Field(default_factory=list)
+
+
+class QuizPracticeQuestion(BaseModel):
+    id: str
+    attemptId: int
+    revision: int
+    quizTitle: str
+    courseId: int | None = None
+    topic: str
+    difficulty: str
+    questionText: str
+    options: list[str]
+    dueAt: str
+    weakTopic: bool
+
+
+class QuizPracticeQueue(BaseModel):
+    items: list[QuizPracticeQuestion]
+    dueCount: int
+    nextReviewAt: str | None = None
+
+
+class QuizPracticeAnswer(BaseModel):
+    attemptId: int = Field(gt=0, le=2_147_483_647)
+    revision: int = Field(ge=0, le=2_147_483_646)
+    selectedIndex: int = Field(ge=0)
+
+
+class QuizPracticeFeedback(QuizAnswerResult):
+    source: str
+    nextReviewAt: str
+
+
+_DIFFICULTY = "^(recall|application|analysis)$"
 
 
 class QuizQuestionCreate(BaseModel):
-    questionText: str
+    questionText: str = Field(..., min_length=1)
     optionsJson: str = "[]"
     correctIndex: int = Field(..., ge=0)
     sortOrder: int = 0
+    topic: Optional[str] = Field(None, max_length=128)
+    difficulty: str = Field("recall", pattern=_DIFFICULTY)
+    explanation: Optional[str] = None
 
 
 class QuizQuestionUpdate(BaseModel):
@@ -61,6 +125,21 @@ class QuizQuestionUpdate(BaseModel):
     optionsJson: Optional[str] = None
     correctIndex: Optional[int] = Field(None, ge=0)
     sortOrder: Optional[int] = None
+    topic: Optional[str] = Field(None, max_length=128)
+    difficulty: Optional[str] = Field(None, pattern=_DIFFICULTY)
+    explanation: Optional[str] = None
+
+
+class QuizCreate(BaseModel):
+    """A teacher's quiz with all its questions, created in one request."""
+
+    courseId: int
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    durationMinutes: int = Field(15, ge=1, le=300)
+    passingScore: float = Field(60.0, ge=0, le=100)
+    topic: Optional[str] = Field(None, max_length=128)
+    questions: List[QuizQuestionCreate] = Field(..., min_length=1, max_length=100)
 
 
 # ─── Adaptive Quiz Generation ─────────────────────────────────────────────────

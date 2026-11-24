@@ -16,8 +16,11 @@ from saarthi_backend.schema.quiz_schemas import (
     AdaptiveQuizResponse,
     GeneratedQuizQuestion,
     PeerComparisonResponse,
+    QuizAnswer,
+    QuizAnswerResult,
     ScoreBucket,
 )
+from saarthi_backend.utils.exceptions import NotFoundError, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +55,40 @@ async def start_attempt(db: AsyncSession, user_id: int, quiz_id: int) -> QuizAtt
 
 async def submit_attempt(
     db: AsyncSession,
+    quiz_id: int,
     attempt_id: int,
     user_id: int,
-    score: float,
-    answers_json: str,
-) -> QuizAttempt | None:
-    return await QuizAttemptDAO.submit(
-        db, attempt_id, user_id, score=score, answers_json=answers_json
-    )
+    answers: list[QuizAnswer],
+) -> tuple[QuizAttempt, list[QuizAnswerResult]]:
+    """Grade the attempt against the stored correct answers and save it.
+
+    The score is the percentage of all quiz questions answered correctly, so
+    unanswered questions count as wrong. An attempt can be submitted only once.
+    """
+    attempt = await QuizAttemptDAO.get_by_id(db, attempt_id)
+    if not attempt or attempt.user_id != user_id or attempt.quiz_id != quiz_id:
+        raise NotFoundError("Attempt not found.", details=None)
+    if attempt.submitted_at is not None:
+        raise ValidationError("This attempt has already been submitted.", details=None)
+
+    questions = await QuizQuestionDAO.list_by_quiz(db, quiz_id)
+    selected = {a.questionId: a.selectedIndex for a in answers}
+    results = [
+        QuizAnswerResult(
+            questionId=str(q.id),
+            selectedIndex=selected.get(str(q.id)),
+            correctIndex=q.correct_index,
+            isCorrect=selected.get(str(q.id)) == q.correct_index,
+            explanation=q.explanation,
+        )
+        for q in questions
+    ]
+    correct = sum(1 for r in results if r.isCorrect)
+    score = round(correct / len(questions) * 100, 2) if questions else 0.0
+
+    answers_json = json.dumps([{"questionId": r.questionId, "selectedIndex": r.selectedIndex} for r in results])
+    submitted = await QuizAttemptDAO.submit(db, attempt_id, user_id, score=score, answers_json=answers_json)
+    return submitted, results
 
 
 async def list_attempts(
@@ -171,8 +200,10 @@ async def generate_adaptive_quiz(
 ) -> AdaptiveQuizResponse:
     """Use GPT-4.1 to generate an adaptive quiz based on past attempt analysis."""
     try:
+        from src.safety.guard import scrub_pii
         from src.utils.llm import async_openai, chat_model_name
         client = async_openai()
+        topic = scrub_pii(body.topic)[0]
 
         # Analyze past performance
         avg_score = 0.0
@@ -195,17 +226,23 @@ async def generate_adaptive_quiz(
 
         attempts_text = ""
         if body.pastAttempts:
-            attempts_text = f"\nPast performance on {body.topic}:\n"
+            attempts_text = f"\nPast performance on {topic}:\n"
             for a in body.pastAttempts[-3:]:  # last 3 attempts
                 attempts_text += f"- {a.quizTitle}: {a.score:.0f}%\n"
             attempts_text += f"Average score: {avg_score:.0f}%\n"
 
-        user_prompt = f"""Generate {body.numQuestions} adaptive quiz questions on: {body.topic}
+        from saarthi_backend.service.chat_service import _kb_excerpts
+        excerpts = _kb_excerpts(topic)[:4000]
+        grounding = (
+            f"\n\nCourse excerpts (base every question on these, with the course's own notation; add no outside facts):\n{excerpts}"
+            if excerpts else ""
+        )
+        user_prompt = f"""Generate {body.numQuestions} adaptive quiz questions on: {topic}
 {"Course: " + body.courseTitle if body.courseTitle else ""}
 Target difficulty: {difficulty}{attempts_text}
 
 Focus on making questions that test deep understanding, not just memorization.
-For engineering students studying signals, systems, ML, or algorithms."""
+For engineering students studying signals, systems, ML, or algorithms.{grounding}"""
 
         response = await client.chat.completions.create(
             model=chat_model_name(),

@@ -336,6 +336,7 @@
 
 /* Admin Actions */
 .course-card-admin-actions {
+    flex-wrap: wrap;
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;
@@ -647,4 +648,13 @@
 [data-theme='dark'] .course-card:hover {
     border-color: var(--accent);
     box-shadow: 0 10px 20px -10px rgba(0, 0, 0, 0.6);
+}
+/* Pending email invite shown as a course card (student) */
+.course-card-invite {
+    cursor: default;
+    border-color: var(--primary);
+}
+
+.course-card-badge.course-card-badge-invite {
+    background: var(--primary);
 }

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from saarthi_backend.model.context_model import Base
@@ -24,6 +24,9 @@ class Course(Base):
     owner_id: Mapped[int | None] = mapped_column(
         ForeignKey("saarthi_users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    syllabus_name: Mapped[str | None] = mapped_column(String(255))
+    syllabus_pdf: Mapped[bytes | None] = mapped_column(LargeBinary, deferred=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -50,6 +53,8 @@ class Assignment(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     due_date: Mapped[str] = mapped_column(String(32), nullable=False)
+    # True: no submissions after the due date ("hard deadline"). False: late work is accepted and marked late.
+    hard_deadline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     points: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     topic: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attachments: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -83,6 +88,23 @@ class Material(Base):
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     url: Mapped[str] = mapped_column(String(512), nullable=False)
     topic: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MaterialAnnotation(Base):
+    """A private highlight anchored to one version of a course PDF."""
+
+    __tablename__ = "saarthi_material_annotations"
+    __table_args__ = (Index("ix_material_annotations_document", "user_id", "material_id", "document_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("saarthi_users.id", ondelete="CASCADE"), nullable=False)
+    material_id: Mapped[int] = mapped_column(ForeignKey("saarthi_materials.id", ondelete="CASCADE"), nullable=False)
+    document_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    page: Mapped[int] = mapped_column(Integer, nullable=False)
+    quote: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    rectangles: Mapped[list[dict[str, float]]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -131,4 +153,40 @@ class StreamComment(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("saarthi_users.id", ondelete="CASCADE"), nullable=False, index=True)
     author: Mapped[str] = mapped_column(String(255), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CourseModule(Base):
+    """A Classwork topic (module). Items link to it by its title in their `topic` field."""
+
+    __tablename__ = "saarthi_course_modules"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("saarthi_courses.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ModulePrerequisite(Base):
+    """A directed dependency between two topics in the same course."""
+
+    __tablename__ = "saarthi_module_prerequisites"
+    __table_args__ = (CheckConstraint("module_id <> prerequisite_id"),)
+
+    module_id: Mapped[int] = mapped_column(ForeignKey("saarthi_course_modules.id", ondelete="CASCADE"), primary_key=True)
+    prerequisite_id: Mapped[int] = mapped_column(ForeignKey("saarthi_course_modules.id", ondelete="CASCADE"), primary_key=True, index=True)
+
+
+class Bookmark(Base):
+    """A student's saved course item (material, video, assignment or quiz)."""
+
+    __tablename__ = "saarthi_bookmarks"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("saarthi_users.id", ondelete="CASCADE"), nullable=False, index=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("saarthi_courses.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -2,29 +2,27 @@ import { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { usePageTitle } from '../lib/usePageTitle';
 import {
-    Search, Filter, Grid3X3, List, BookOpen,
-    ChevronDown, Plus, Edit3, Trash2, X, Save, LogIn
+    Search, Grid3X3, List, BookOpen,
+    Plus, Edit3, Trash2, X, Save, LogIn, Archive, RotateCcw
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
-import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse } from '../lib/api';
+import { api, type CourseResponse, type PaginatedResponse, type EnrollmentWithCourseResponse, type MyInviteResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
+import ConfirmModal from '../components/ConfirmModal';
 import { useToast } from '../components/Toast';
 import './Courses.css';
 
+// Only fields the backend stores. Category, difficulty, duration and lesson count were
+// form-only values that the API dropped, so they are not shown or edited.
 interface CourseItem {
     id: string;
     title: string;
     code: string;
     instructor: string;
-    category: string;
-    difficulty: 'Beginner' | 'Intermediate' | 'Advanced';
-    duration: string;
-    lessons: number;
-    rating: number;
-    students: number;
     progress: number;
     thumbnail: string;
     description: string;
+    archivedAt: string | null;
 }
 
 function mapCourse(c: CourseResponse, progressPercent = 0): CourseItem {
@@ -33,20 +31,13 @@ function mapCourse(c: CourseResponse, progressPercent = 0): CourseItem {
         title: c.title,
         code: c.code,
         instructor: c.instructor,
-        category: 'Course',
-        difficulty: 'Intermediate',
-        duration: '',
-        lessons: 0,
-        rating: 0,
-        students: 0,
         progress: progressPercent,
         thumbnail: c.thumbnailEmoji || '📚',
         description: c.description || '',
+        archivedAt: c.archivedAt ?? null,
     };
 }
 
-const categories = ['All', 'Computer Science', 'Electronics', 'Mathematics'];
-const difficulties = ['All', 'Beginner', 'Intermediate', 'Advanced'];
 const PAGE_SIZE = 20;
 
 export default function CoursesPage() {
@@ -60,12 +51,12 @@ export default function CoursesPage() {
     const [offset, setOffset] = useState(0);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [enrolledIds, setEnrolledIds] = useState<Record<string, number>>({});
     const [search, setSearch] = useState('');
-    const [category, setCategory] = useState('All');
-    const [difficulty, setDifficulty] = useState('All');
+    const [showArchived, setShowArchived] = useState(false);
     const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
-    const [showFilters, setShowFilters] = useState(false);
+    const [invites, setInvites] = useState<MyInviteResponse[]>([]);
+    const [inviteBusyId, setInviteBusyId] = useState<string | null>(null);
+    const [reloadKey, setReloadKey] = useState(0); // bumped after accepting an invite to refresh the list
     const navigate = useNavigate();
     const toast = useToast();
     const [searchParams, setSearchParams] = useSearchParams();
@@ -76,12 +67,12 @@ export default function CoursesPage() {
             setLoading(true);
             setError(null);
             try {
-                const res = await api.get<PaginatedResponse<CourseResponse>>('/courses', { limit: PAGE_SIZE, offset });
+                const res = await api.get<PaginatedResponse<CourseResponse>>('/courses', { limit: PAGE_SIZE, offset, archived: showArchived ? 1 : 0 });
                 if (cancelled) return;
                 const progressMap: Record<string, number> = {};
                 const enrollmentsRes = await api.get<PaginatedResponse<EnrollmentWithCourseResponse>>('/courses/my/enrollments', { limit: 100, offset: 0 });
                 (enrollmentsRes.items || []).forEach((e) => { progressMap[e.courseId] = e.progressPercent; });
-                setEnrolledIds(progressMap);
+                if (cancelled) return;
                 setCourses((res.items || []).map((c) => mapCourse(c, progressMap[c.id] ?? 0)));
                 setTotal(res.total ?? 0);
             } catch (e) {
@@ -91,12 +82,51 @@ export default function CoursesPage() {
             }
         })();
         return () => { cancelled = true; };
-    }, [offset]);
+    }, [offset, reloadKey, showArchived]);
+
+    // Email invites from teachers, shown to students as cards they can accept or reject.
+    useEffect(() => {
+        if (isInstructor) return;
+        let cancelled = false;
+        api.get<MyInviteResponse[]>('/courses/my/invites')
+            .then((items) => { if (!cancelled) setInvites(items); })
+            .catch(() => { /* the course list still works without invites */ });
+        return () => { cancelled = true; };
+    }, [isInstructor]);
+
+    const acceptInvite = async (invite: MyInviteResponse) => {
+        setInviteBusyId(invite.id);
+        try {
+            await api.post('/courses/join', { inviteCode: invite.inviteCode });
+            setInvites((prev) => prev.filter((i) => i.id !== invite.id));
+            setReloadKey((k) => k + 1);
+            toast.showToast(`You joined ${invite.courseTitle}`);
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not join the course', 'error');
+        } finally {
+            setInviteBusyId(null);
+        }
+    };
+
+    const rejectInvite = async (invite: MyInviteResponse) => {
+        setInviteBusyId(invite.id);
+        try {
+            await api.post(`/courses/invites/${invite.id}/decline`);
+            setInvites((prev) => prev.filter((i) => i.id !== invite.id));
+            toast.showToast(`Invite to ${invite.courseTitle} declined`);
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not decline the invite', 'error');
+        } finally {
+            setInviteBusyId(null);
+        }
+    };
 
     // Modal state
     const [showModal, setShowModal] = useState(false);
     const [editingCourse, setEditingCourse] = useState<CourseItem | null>(null);
     const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+    const [archiveTarget, setArchiveTarget] = useState<CourseItem | null>(null);
+    const [archiveBusy, setArchiveBusy] = useState(false);
 
     // Join with code (student)
     const [showJoinModal, setShowJoinModal] = useState(false);
@@ -135,24 +165,23 @@ export default function CoursesPage() {
     // Form state
     const [formData, setFormData] = useState<Partial<CourseItem>>({});
 
-    const filtered = courses.filter((c) => {
-        if (!isInstructor && enrolledIds[c.id] === undefined) return false;
-        const matchSearch = !search.trim() || c.title.toLowerCase().includes(search.toLowerCase()) || c.code.toLowerCase().includes(search.toLowerCase());
-        const matchCat = category === 'All' || c.category === category;
-        const matchDiff = difficulty === 'All' || c.difficulty === difficulty;
-        return matchSearch && matchCat && matchDiff;
-    });
+    const filter = search.trim().toLowerCase();
+    const filtered = courses.filter((c) => !filter || c.title.toLowerCase().includes(filter) || c.code.toLowerCase().includes(filter));
+    const visibleInvites = showArchived ? [] : invites;
 
-    const diffColor = (d: string) => {
-        if (d === 'Beginner') return '#5E8D83';
-        if (d === 'Intermediate') return '#8C7A4A';
-        return '#7A5A6E';
+    const selectArchiveView = (archived: boolean) => {
+        if (showArchived === archived) return;
+        setLoading(true);
+        setCourses([]);
+        setTotal(0);
+        setOffset(0);
+        setShowArchived(archived);
     };
 
     // Admin CRUD
     const openCreate = () => {
         setEditingCourse(null);
-        setFormData({ title: '', code: '', instructor: '', category: 'Computer Science', difficulty: 'Beginner', duration: '', lessons: 0, description: '', thumbnail: '📚' });
+        setFormData({ title: '', code: '', instructor: '', description: '', thumbnail: '📚' });
         setShowModal(true);
     };
 
@@ -163,46 +192,37 @@ export default function CoursesPage() {
     };
 
     const handleSave = async () => {
-        if (editingCourse) {
-            setCourses((prev) => prev.map((c) => (c.id === editingCourse.id ? { ...c, ...formData } as CourseItem : c)));
-            setShowModal(false);
-            return;
-        }
         const title = (formData.title || '').trim();
         const code = (formData.code || '').trim();
         const instructor = (formData.instructor || user?.name || 'Instructor').trim();
         if (!title || !code || !instructor) {
             return;
         }
+        const payload = {
+            title,
+            code,
+            instructor,
+            description: (formData.description || '').trim() || undefined,
+            thumbnailEmoji: (formData.thumbnail || '📚').trim() || undefined,
+        };
         try {
-            const created = await api.post<CourseResponse>('/courses', {
-                title,
-                code,
-                instructor,
-                description: (formData.description || '').trim() || undefined,
-                thumbnailEmoji: (formData.thumbnail || '📚').trim() || undefined,
-                color: undefined,
-            });
-            const newCourse: CourseItem = {
-                id: created.id,
-                title: created.title,
-                code: created.code,
-                instructor: created.instructor,
-                category: formData.category || 'Computer Science',
-                difficulty: (formData.difficulty as CourseItem['difficulty']) || 'Beginner',
-                duration: formData.duration || '12 weeks',
-                lessons: formData.lessons || 0,
-                rating: 0,
-                students: 0,
-                progress: 0,
-                thumbnail: created.thumbnailEmoji || '📚',
-                description: created.description || '',
-            };
-            setCourses((prev) => [newCourse, ...prev]);
-            setTotal((t) => t + 1);
+            if (editingCourse) {
+                const updated = await api.patch<CourseResponse>(`/courses/${editingCourse.id}`, payload);
+                setCourses((prev) => prev.map((c) => (c.id === updated.id ? mapCourse(updated, c.progress) : c)));
+                toast.showToast('Course updated');
+            } else {
+                const created = await api.post<CourseResponse>('/courses', payload);
+                if (showArchived) selectArchiveView(false);
+                else {
+                    setCourses((prev) => [mapCourse(created), ...prev]);
+                    setTotal((t) => t + 1);
+                }
+            }
             setShowModal(false);
         } catch (e) {
-            setError(e instanceof Error ? e.message : 'Failed to create course');
+            const msg = e instanceof Error ? e.message : 'Failed to save course';
+            setError(msg);
+            toast.showToast(msg, 'error');
         }
     };
 
@@ -219,6 +239,24 @@ export default function CoursesPage() {
             const msg = e instanceof Error ? e.message : 'Failed to delete course';
             setError(msg);
             toast.showToast(msg, 'error');
+        }
+    };
+
+    const changeArchive = async () => {
+        if (!archiveTarget || archiveBusy) return;
+        const archived = !archiveTarget.archivedAt;
+        setArchiveBusy(true);
+        try {
+            await api.put(`/courses/${archiveTarget.id}/archive`, { archived });
+            setCourses((items) => items.filter((item) => item.id !== archiveTarget.id));
+            setOffset(0);
+            setReloadKey((key) => key + 1);
+            toast.showToast(archived ? 'Course archived' : 'Course restored');
+            setArchiveTarget(null);
+        } catch (error) {
+            toast.showToast(error instanceof Error ? error.message : 'Could not update the course', 'error');
+        } finally {
+            setArchiveBusy(false);
         }
     };
 
@@ -252,34 +290,18 @@ export default function CoursesPage() {
                     <input placeholder="Search courses..." value={search} onChange={(e) => setSearch(e.target.value)} />
                 </div>
                 <div className="courses-toolbar-right">
-                    <button className={`courses-filter-toggle ${showFilters ? 'active' : ''}`} onClick={() => setShowFilters(!showFilters)}>
-                        <Filter size={16} /> Filters <ChevronDown size={14} />
-                    </button>
+                    <div className="courses-view-toggle" role="group" aria-label="Course status">
+                        <button type="button" className={!showArchived ? 'active' : ''} aria-pressed={!showArchived}
+                            onClick={() => selectArchiveView(false)}>Active</button>
+                        <button type="button" className={showArchived ? 'active' : ''} aria-pressed={showArchived}
+                            onClick={() => selectArchiveView(true)}>Archived</button>
+                    </div>
                     <div className="courses-view-toggle">
                         <button className={viewMode === 'grid' ? 'active' : ''} onClick={() => setViewMode('grid')}><Grid3X3 size={16} /></button>
                         <button className={viewMode === 'list' ? 'active' : ''} onClick={() => setViewMode('list')}><List size={16} /></button>
                     </div>
                 </div>
             </div>
-
-            {/* Filters */}
-            {showFilters && (
-                <div className="courses-filters animate-fade-in">
-                    <div className="courses-filter-group">
-                        <label>Category</label>
-                        <select value={category} onChange={(e) => setCategory(e.target.value)}>
-                            {categories.map((c) => <option key={c} value={c}>{c}</option>)}
-                        </select>
-                    </div>
-                    <div className="courses-filter-group">
-                        <label>Difficulty</label>
-                        <select value={difficulty} onChange={(e) => setDifficulty(e.target.value)}>
-                            {difficulties.map((d) => <option key={d} value={d}>{d}</option>)}
-                        </select>
-                    </div>
-                    <span className="courses-result-count">{filtered.length} courses found</span>
-                </div>
-            )}
 
             {/* Grid / List */}
             {loading && filtered.length === 0 ? (
@@ -302,11 +324,31 @@ export default function CoursesPage() {
                 </div>
             ) : (
             <div className={`courses-grid ${viewMode}`}>
+                {visibleInvites.map((inv) => (
+                    <div key={`invite-${inv.id}`} className={`course-card course-card-invite ${viewMode}`}>
+                        <div className="course-card-thumb">
+                            <span className="course-card-emoji">{inv.thumbnailEmoji || '📚'}</span>
+                            <span className="course-card-badge course-card-badge-invite">Invitation</span>
+                        </div>
+                        <div className="course-card-body">
+                            <div className="course-card-top">
+                                <span className="course-card-code">{inv.courseCode}</span>
+                            </div>
+                            <h3 className="course-card-title">{inv.courseTitle}</h3>
+                            <p className="course-card-instructor">{inv.instructor}</p>
+                            <div className="course-card-footer">
+                                <div className="course-card-admin-actions">
+                                    <button className="btn btn-primary btn-sm" disabled={inviteBusyId === inv.id} onClick={() => acceptInvite(inv)}>Accept</button>
+                                    <button className="btn btn-outline btn-sm" disabled={inviteBusyId === inv.id} onClick={() => rejectInvite(inv)}>Reject</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                ))}
                 {filtered.map((course) => (
                     <div key={course.id} className={`course-card ${viewMode}`} onClick={() => navigate(`/courses/${course.id}`)} style={{ cursor: 'pointer' }}>
                         <div className="course-card-thumb">
                             <span className="course-card-emoji">{course.thumbnail}</span>
-                            <span className="course-card-badge" style={{ background: diffColor(course.difficulty) }}>{course.difficulty}</span>
                         </div>
                         <div className="course-card-body">
                             <div className="course-card-top">
@@ -319,6 +361,9 @@ export default function CoursesPage() {
                                 {isInstructor ? (
                                     <div className="course-card-admin-actions">
                                         <button className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); openEdit(course); }}><Edit3 size={14} /> Edit</button>
+                                        <button type="button" className="btn btn-outline btn-sm" onClick={(ev) => { ev.stopPropagation(); setArchiveTarget(course); }}>
+                                            {course.archivedAt ? <><RotateCcw size={14} /> Restore</> : <><Archive size={14} /> Archive</>}
+                                        </button>
                                         {deleteConfirm === course.id ? (
                                             <div className="course-card-delete-confirm">
                                                 <span>Delete?</span>
@@ -344,11 +389,11 @@ export default function CoursesPage() {
             </div>
             )}
 
-            {!loading && filtered.length === 0 && (
+            {!loading && filtered.length === 0 && visibleInvites.length === 0 && (
                 <div className="courses-empty">
                     <BookOpen size={48} />
                     <h3>No courses found</h3>
-                    <p>{isInstructor ? 'Try adjusting your search or filters' : 'Enter the class code from your teacher above to join a course'}</p>
+                    <p>{showArchived ? 'Archived courses appear here.' : isInstructor ? 'Try adjusting your search or filters' : 'Enter the class code from your teacher above to join a course'}</p>
                 </div>
             )}
             {!loading && total > 0 && (
@@ -356,6 +401,11 @@ export default function CoursesPage() {
             )}
 
             {/* Create / Edit Modal */}
+            <ConfirmModal open={archiveTarget !== null} title={archiveTarget?.archivedAt ? 'Restore course' : 'Archive course'}
+                message={archiveTarget?.archivedAt ? 'This course will return to Active Courses and accept new enrollments.' : 'The course will move to Archived Courses. Current students can still open it, and new enrollments will close.'}
+                confirmLabel={archiveTarget?.archivedAt ? 'Restore' : 'Archive'} variant="primary" loading={archiveBusy}
+                onConfirm={() => void changeArchive()} onCancel={() => { if (!archiveBusy) setArchiveTarget(null); }} />
+
             {showModal && (
                 <div className="course-modal-overlay" onClick={() => setShowModal(false)}>
                     <div className="course-modal animate-scale-in" onClick={(e) => e.stopPropagation()}>
@@ -378,33 +428,9 @@ export default function CoursesPage() {
                                     <input className="input" value={formData.thumbnail || ''} onChange={(e) => setFormData({ ...formData, thumbnail: e.target.value })} />
                                 </div>
                             </div>
-                            <div className="course-modal-row">
-                                <div className="course-modal-field">
-                                    <label>Category</label>
-                                    <select className="input" value={formData.category || ''} onChange={(e) => setFormData({ ...formData, category: e.target.value })}>
-                                        {categories.filter(c => c !== 'All').map((c) => <option key={c} value={c}>{c}</option>)}
-                                    </select>
-                                </div>
-                                <div className="course-modal-field">
-                                    <label>Difficulty</label>
-                                    <select className="input" value={formData.difficulty || ''} onChange={(e) => setFormData({ ...formData, difficulty: e.target.value as CourseItem['difficulty'] })}>
-                                        {difficulties.filter(d => d !== 'All').map((d) => <option key={d} value={d}>{d}</option>)}
-                                    </select>
-                                </div>
-                            </div>
-                            <div className="course-modal-row">
-                                <div className="course-modal-field">
-                                    <label>Instructor</label>
-                                    <input className="input" placeholder="e.g. Dr. Sharma" value={formData.instructor || ''} onChange={(e) => setFormData({ ...formData, instructor: e.target.value })} />
-                                </div>
-                                <div className="course-modal-field">
-                                    <label>Duration</label>
-                                    <input className="input" placeholder="e.g. 12 weeks" value={formData.duration || ''} onChange={(e) => setFormData({ ...formData, duration: e.target.value })} />
-                                </div>
-                            </div>
                             <div className="course-modal-field">
-                                <label>Number of Lessons</label>
-                                <input className="input" type="number" value={formData.lessons || 0} onChange={(e) => setFormData({ ...formData, lessons: parseInt(e.target.value) || 0 })} />
+                                <label>Instructor</label>
+                                <input className="input" placeholder="e.g. Dr. Sharma" value={formData.instructor || ''} onChange={(e) => setFormData({ ...formData, instructor: e.target.value })} />
                             </div>
                             <div className="course-modal-field">
                                 <label>Description</label>

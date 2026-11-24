@@ -1,19 +1,34 @@
-import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { lazy, Suspense, useState, useEffect, useRef } from 'react';
+import { Link, useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
     ArrowLeft, Plus, FileText, Video, BookOpen, Trash2, X, Save, Paperclip,
     Link as LinkIcon, Heading, Pencil, ExternalLink, Send, Sparkles, Users,
-    Mail, LogIn, CheckCircle2, XCircle
+    Mail, LogIn, CheckCircle2, XCircle, ListChecks, Bookmark, ChevronUp, ChevronDown
 } from 'lucide-react';
 import { useAuthStore } from '../stores/auth.store';
 import StreamComments from '../components/StreamComments';
-import { api, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse, type VideoResponse } from '../lib/api';
+import AssignmentDialog from '../components/AssignmentDialog';
+import AuthImage from '../components/AuthImage';
+import QuizEditor from '../components/QuizEditor';
+import MaterialIndexBadge from '../components/MaterialIndexBadge';
+import CourseSyllabus from '../components/CourseSyllabus';
+import ModulePrerequisites from '../components/ModulePrerequisites';
+import { formatDue, isClosed, statusLabel, toDateTimeLocal } from '../lib/assignmentStatus';
+import { api, authFetch, getAllPages, uploadFile, getUploadFullUrl, getMaterialFileUrl, type CourseResponse, type PaginatedResponse, type AssignmentResponse, type MaterialResponse, type StreamItemResponse, type CoursePersonResponse, type VideoResponse, type ModuleResponse, type BookmarkResponse, type QuizResponse } from '../lib/api';
 import Pagination from '../components/Pagination';
 import FileDropzone from '../components/FileDropzone';
 import ConfirmModal from '../components/ConfirmModal';
 import EmptyState from '../components/EmptyState';
 import { useToast } from '../components/Toast';
+import AIReviewPanel from '../components/AIReviewPanel';
+import CourseQueryLog from '../components/CourseQueryLog';
+import AnswerSources from '../components/AnswerSources';
+import { useResourceActivity } from '../lib/useResourceActivity';
+import { streamChat } from '../lib/streamChat';
+import type { ChatAnswerMetadata, ConversationResponse } from '../lib/api';
 import './CourseDetail.css';
+
+const MaterialPdf = lazy(() => import('../components/MaterialPdf'));
 
 const PAGE_SIZE = 20;
 
@@ -29,13 +44,16 @@ interface Assignment {
     attachments: string[];
     createdAt: string;
     topic: string;
+    submittedAt?: string | null;
+    attachmentUrl?: string | null;
+    hardDeadline?: boolean;
 }
 
 interface Material {
     id: string;
     title: string;
     description: string;
-    type: 'pdf' | 'doc' | 'link' | 'slide';
+    type: 'pdf' | 'doc' | 'link' | 'slide' | 'exercise' | 'code';
     url: string;
     createdAt: string;
     topic: string;
@@ -55,16 +73,22 @@ interface VideoLecture {
 
 interface StreamItem {
     id: string;
-    type: 'assignment' | 'material' | 'video' | 'announcement';
+    type: 'assignment' | 'material' | 'video' | 'quiz' | 'announcement';
     title: string;
     description: string;
     createdAt: string;
     author: string;
     comments?: { id: string, text: string, author: string, createdAt: string }[];
-    attachments?: { name: string, url: string }[];
+    // Announcements store a public url; material posts store the material's id.
+    attachments?: { name: string, url?: string, materialId?: string }[];
 }
 
-type DocChatMessage = { role: 'user' | 'assistant'; content: string };
+type DocChatMessage = { role: 'user' | 'assistant'; content: string; metadata?: ChatAnswerMetadata | null };
+
+/** AI answers can quote uploaded course text, so escape HTML before the light markdown below
+ *  (security review S2: a poisoned file could otherwise run script in students' browsers). */
+const escapeHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 const tabs = [
     { id: 'stream', label: 'Stream' },
@@ -73,6 +97,24 @@ const tabs = [
 ];
 
 type ModalType = 'assignment' | 'material' | 'video' | 'topic' | null;
+
+/** Classwork filter: resource types A notes, B video, C exercise, D code, plus work and bookmarks. */
+const CLASSWORK_FILTERS = [
+    { id: 'all', label: 'All' },
+    { id: 'notes', label: 'Notes' },
+    { id: 'video', label: 'Videos' },
+    { id: 'exercise', label: 'Exercises' },
+    { id: 'code', label: 'Code' },
+    { id: 'assignment', label: 'Assignments' },
+    { id: 'quiz', label: 'Quizzes' },
+    { id: 'bookmarked', label: 'Bookmarked' },
+] as const;
+type ClassworkFilter = typeof CLASSWORK_FILTERS[number]['id'];
+
+function itemKind(item: { itemType: string; type?: string }): ClassworkFilter {
+    if (item.itemType === 'material') return item.type === 'exercise' || item.type === 'code' ? item.type : 'notes';
+    return item.itemType as ClassworkFilter;
+}
 
 function mapAssignment(a: AssignmentResponse): Assignment {
     return {
@@ -86,17 +128,21 @@ function mapAssignment(a: AssignmentResponse): Assignment {
         attachments: a.attachments ? [a.attachments] : [],
         createdAt: a.createdAt,
         topic: a.topic ?? 'No topic',
+        submittedAt: a.submittedAt,
+        attachmentUrl: a.attachmentUrl,
+        hardDeadline: a.hardDeadline,
     };
 }
 
 function mapMaterial(m: MaterialResponse): Material {
+    const created = new Date(m.createdAt);
     return {
         id: m.id,
         title: m.title,
         description: m.description ?? '',
         type: m.type as Material['type'],
         url: m.url,
-        createdAt: m.createdAt,
+        createdAt: Number.isNaN(created.getTime()) ? m.createdAt : created.toLocaleDateString(undefined, { dateStyle: 'medium' }),
         topic: m.topic ?? 'No topic',
     };
 }
@@ -113,7 +159,7 @@ function mapVideo(v: VideoResponse): VideoLecture {
         url: v.url,
         watched: false,
         createdAt: '',
-        topic: 'Video Lectures',  // videos have no topic column yet
+        topic: v.topic ?? 'No topic',
     };
 }
 
@@ -129,7 +175,7 @@ function mapStreamItem(s: StreamItemResponse): StreamItem {
     let raw = s.description || '';
     let description = raw;
     let comments: { id: string, text: string, author: string, createdAt: string }[] = [];
-    let attachments: { name: string, url: string }[] = [];
+    let attachments: { name: string, url?: string, materialId?: string }[] = [];
 
     // Parse out attachments first
     if (description.includes('___ATTACHMENTS___')) {
@@ -144,12 +190,13 @@ function mapStreamItem(s: StreamItemResponse): StreamItem {
         try { comments = JSON.parse(parts[1]); } catch { /* ignore */ }
     }
 
+    const created = new Date(s.createdAt);
     return {
         id: s.id,
         type: (s.type as StreamItem['type']) || 'announcement',
         title: s.title ?? '',
         description,
-        createdAt: s.createdAt,
+        createdAt: Number.isNaN(created.getTime()) ? s.createdAt : created.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }),
         author: s.author,
         comments,
         attachments,
@@ -168,13 +215,11 @@ export default function CourseDetailPage() {
     const [course, setCourse] = useState<CourseResponse | null>(null);
     const [courseLoading, setCourseLoading] = useState(true);
     const [courseError, setCourseError] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState('stream');
+    const [searchParams, setSearchParams] = useSearchParams();
+    const [activeTab, setActiveTab] = useState(() => searchParams.get('tab') === 'classwork' ? 'classwork' : 'stream');
     const [assignments, setAssignments] = useState<Assignment[]>([]);
-    const [assignmentsTotal, setAssignmentsTotal] = useState(0);
-    const [assignmentsOffset, setAssignmentsOffset] = useState(0);
     const [materials, setMaterials] = useState<Material[]>([]);
-    const [materialsTotal, setMaterialsTotal] = useState(0);
-    const [materialsOffset, setMaterialsOffset] = useState(0);
+    const [materialsLoadedFor, setMaterialsLoadedFor] = useState<string | null>(null);
     const [stream, setStream] = useState<StreamItem[]>([]);
     const [streamTotal, setStreamTotal] = useState(0);
     const [streamOffset, setStreamOffset] = useState(0);
@@ -182,7 +227,16 @@ export default function CourseDetailPage() {
     const [peopleTotal, setPeopleTotal] = useState(0);
     const [peopleOffset, setPeopleOffset] = useState(0);
     const [videos, setVideos] = useState<VideoLecture[]>([]);
-    const [topics, setTopics] = useState<string[]>(['Course Materials', 'Class Work', 'Projects', 'Video Lectures', 'Post Exam - Solutions']);
+    const [quizzes, setQuizzes] = useState<QuizResponse[]>([]);
+    // Classwork topics (course modules), saved on the server in order.
+    const [modules, setModules] = useState<ModuleResponse[]>([]);
+    const [editingPrerequisites, setEditingPrerequisites] = useState<{ courseId: string; moduleId: string } | null>(null);
+    const [reorderingModules, setReorderingModules] = useState(false);
+    const topics = modules.map((m) => m.title);
+    const requiredTopics = new Set(modules.flatMap((module) => module.prerequisiteIds ?? []));
+    const [bookmarks, setBookmarks] = useState<BookmarkResponse[]>([]);
+    const [classworkFilter, setClassworkFilter] = useState<ClassworkFilter>('all');
+    const [showQuizEditor, setShowQuizEditor] = useState(false);
 
     const courseDisplay = course ? { title: course.title, code: course.code, instructor: course.instructor, emoji: course.thumbnailEmoji || '📚', color: course.color || '#3f4244' } : { title: '…', code: '', instructor: '', emoji: '📚', color: '#3f4244' };
     const userName = user?.name || (isInstructor ? courseDisplay.instructor : 'Student');
@@ -199,23 +253,25 @@ export default function CourseDetailPage() {
         return () => { cancelled = true; };
     }, [courseId]);
 
+    // Classwork groups assignments and materials by topic, so it needs every item, not one page.
     useEffect(() => {
         if (!courseId) return;
         let cancelled = false;
-        api.get<PaginatedResponse<AssignmentResponse>>(`/courses/${courseId}/assignments`, { limit: PAGE_SIZE, offset: assignmentsOffset })
-            .then((r) => { if (!cancelled) { setAssignments((r.items || []).map(mapAssignment)); setAssignmentsTotal(r.total ?? 0); } })
+        getAllPages<AssignmentResponse>(`/courses/${courseId}/assignments`)
+            .then((items) => { if (!cancelled) setAssignments(items.map(mapAssignment)); })
             .catch(() => { if (!cancelled) setAssignments([]); });
         return () => { cancelled = true; };
-    }, [courseId, assignmentsOffset]);
+    }, [courseId]);
 
     useEffect(() => {
         if (!courseId) return;
         let cancelled = false;
-        api.get<PaginatedResponse<MaterialResponse>>(`/courses/${courseId}/materials`, { limit: PAGE_SIZE, offset: materialsOffset })
-            .then((r) => { if (!cancelled) { setMaterials((r.items || []).map(mapMaterial)); setMaterialsTotal(r.total ?? 0); } })
-            .catch(() => { if (!cancelled) setMaterials([]); });
+        getAllPages<MaterialResponse>(`/courses/${courseId}/materials`)
+            .then((items) => { if (!cancelled) setMaterials(items.map(mapMaterial)); })
+            .catch(() => { if (!cancelled) setMaterials([]); })
+            .finally(() => { if (!cancelled) setMaterialsLoadedFor(courseId); });
         return () => { cancelled = true; };
-    }, [courseId, materialsOffset]);
+    }, [courseId]);
 
     useEffect(() => {
         if (!courseId) return;
@@ -226,14 +282,89 @@ export default function CourseDetailPage() {
         return () => { cancelled = true; };
     }, [courseId]);
 
-    // Topics live on the items; keep any topic that an item uses so it survives a reload.
+    // Topics (modules), quizzes and the user's bookmarks for this course.
     useEffect(() => {
-        const used = [...assignments, ...materials].map((i) => i.topic).filter((t) => t && t !== 'No topic');
-        setTopics((prev) => {
-            const extra = used.filter((t, i) => !prev.includes(t) && used.indexOf(t) === i);
-            return extra.length ? [...prev, ...extra] : prev;
-        });
-    }, [assignments, materials]);
+        if (!courseId) return;
+        let cancelled = false;
+        api.get<ModuleResponse[]>(`/courses/${courseId}/modules`)
+            .then((r) => { if (!cancelled) setModules(r); })
+            .catch(() => { if (!cancelled) setModules([]); });
+        getAllPages<QuizResponse>('/quizzes', { course_id: courseId })
+            .then((r) => { if (!cancelled) setQuizzes(r); })
+            .catch(() => { if (!cancelled) setQuizzes([]); });
+        api.get<BookmarkResponse[]>('/courses/my/bookmarks', { course_id: courseId })
+            .then((r) => { if (!cancelled) setBookmarks(r); })
+            .catch(() => { if (!cancelled) setBookmarks([]); });
+        return () => { cancelled = true; };
+    }, [courseId]);
+
+    const bookmarkFor = (itemType: string, itemId: string) => bookmarks.find((b) => b.itemType === itemType && b.itemId === itemId);
+
+    const toggleBookmark = async (item: { id: string; itemType: BookmarkResponse['itemType']; title: string }) => {
+        const existing = bookmarkFor(item.itemType, item.id);
+        try {
+            if (existing) {
+                await api.delete(`/courses/${courseId}/bookmarks/${existing.id}`);
+                setBookmarks((prev) => prev.filter((b) => b.id !== existing.id));
+            } else {
+                const b = await api.post<BookmarkResponse>(`/courses/${courseId}/bookmarks`, { itemType: item.itemType, itemId: item.id, title: item.title });
+                setBookmarks((prev) => [b, ...prev]);
+            }
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not update bookmark', 'error');
+        }
+    };
+
+    /** Items keep their topic by name, so renaming or deleting a topic updates them here too. */
+    const retopicItems = (from: string, to: string) => {
+        const move = <T extends { topic: string }>(list: T[]) => list.map((x) => (x.topic === from ? { ...x, topic: to } : x));
+        setAssignments(move);
+        setMaterials(move);
+        setVideos(move);
+        setQuizzes((prev) => prev.map((q) => (q.topic === from ? { ...q, topic: to === 'No topic' ? null : to } : q)));
+    };
+
+    const renameModule = async (m: ModuleResponse) => {
+        const title = window.prompt('Rename topic', m.title)?.trim();
+        if (!title || title === m.title) return;
+        try {
+            const updated = await api.patch<ModuleResponse>(`/courses/${courseId}/modules/${m.id}`, { title });
+            setModules((prev) => prev.map((x) => (x.id === m.id ? updated : x)));
+            retopicItems(m.title, updated.title);
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not rename topic', 'error');
+        }
+    };
+
+    const deleteModule = async (m: ModuleResponse) => {
+        if (!window.confirm(`Delete the topic "${m.title}"? Its work stays in the course under "No topic".`)) return;
+        try {
+            await api.delete(`/courses/${courseId}/modules/${m.id}`);
+            setModules((prev) => prev.filter((x) => x.id !== m.id).map((x) => ({
+                ...x, prerequisiteIds: (x.prerequisiteIds ?? []).filter((id) => id !== m.id),
+            })));
+            retopicItems(m.title, 'No topic');
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not delete topic', 'error');
+        }
+    };
+
+    /** Swap a topic with its neighbour and save both positions. */
+    const moveModule = async (index: number, delta: -1 | 1) => {
+        const other = index + delta;
+        if (other < 0 || other >= modules.length || reorderingModules) return;
+        const next = [...modules];
+        [next[index], next[other]] = [next[other], next[index]];
+        setReorderingModules(true);
+        try {
+            const ordered = await api.put<ModuleResponse[]>(`/courses/${courseId}/modules/order`, { moduleIds: next.map((module) => Number(module.id)) });
+            setModules(ordered);
+        } catch (e) {
+            toast.showToast(e instanceof Error ? e.message : 'Could not reorder topics', 'error');
+        } finally {
+            setReorderingModules(false);
+        }
+    };
 
     useEffect(() => {
         if (!courseId) return;
@@ -253,27 +384,6 @@ export default function CourseDetailPage() {
         return () => { cancelled = true; };
     }, [courseId, activeTab, peopleOffset]);
 
-    const handleSubmitAssignment = async () => {
-        if (!courseId || !submitAssignmentId) return;
-        setSubmitting(true);
-        try {
-            let attachmentUrl: string | undefined;
-            if (submitFile) {
-                const { url } = await uploadFile(submitFile);
-                attachmentUrl = url;
-            }
-            await api.post(`/courses/${courseId}/assignments/${submitAssignmentId}/submit`, { attachmentUrl });
-            setAssignments((prev) => prev.map((a) => (a.id === submitAssignmentId ? { ...a, status: 'submitted' as const } : a)));
-            setSubmitAssignmentId(null);
-            setSubmitFile(null);
-            toast.showToast('Assignment submitted');
-        } catch (e) {
-            toast.showToast(e instanceof Error ? e.message : 'Submit failed', 'error');
-        } finally {
-            setSubmitting(false);
-        }
-    };
-
     // Compose Annoucnement
     const [isComposing, setIsComposing] = useState(false);
     const [announcementText, setAnnouncementText] = useState('');
@@ -283,10 +393,18 @@ export default function CourseDetailPage() {
     const [editItem, setEditItem] = useState<any>(null);
     const [formData, setFormData] = useState<any>({});
     const [createMenuOpen, setCreateMenuOpen] = useState(false);
-    const [submitAssignmentId, setSubmitAssignmentId] = useState<string | null>(null);
-    const [submitFile, setSubmitFile] = useState<File | null>(null);
-    const [submitting, setSubmitting] = useState(false);
-    const [viewingMaterial, setViewingMaterial] = useState<Material | null>(null);
+    const [openAssignmentId, setOpenAssignmentId] = useState<string | null>(null);
+    const [showMyWork, setShowMyWork] = useState(false);
+    const requestedMaterial = searchParams.get('material');
+    const requestedPage = Number(searchParams.get('page'));
+    const viewingMaterial = materialsLoadedFor === courseId ? materials.find((item) => item.id === requestedMaterial) : null;
+    const setViewingMaterial = (item: Material | null) => {
+        const next = new URLSearchParams(searchParams);
+        next.delete('page');
+        if (item) next.set('material', item.id);
+        else next.delete('material');
+        setSearchParams(next, { replace: true });
+    };
     const [savingMaterial, setSavingMaterial] = useState(false);
     const [deletingMaterialId, setDeletingMaterialId] = useState<string | null>(null);
     const [materialToDelete, setMaterialToDelete] = useState<Material | null>(null);
@@ -295,22 +413,23 @@ export default function CourseDetailPage() {
     const [docChatFollowups, setDocChatFollowups] = useState<string[]>([]);
     const [docChatInput, setDocChatInput] = useState('');
     const [docChatSending, setDocChatSending] = useState(false);
+    const docChatSession = useRef({ conversationId: '' });
     const [docPdfObjectUrl, setDocPdfObjectUrl] = useState<string | null>(null);
+    const [docVersion, setDocVersion] = useState<string | null>(null);
     const [docPdfError, setDocPdfError] = useState<string | null>(null);
     const [docPdfLoading, setDocPdfLoading] = useState(false);
+    const pdfPageUrl = docPdfObjectUrl && Number.isSafeInteger(requestedPage) && requestedPage > 0
+        ? `${docPdfObjectUrl}#page=${requestedPage}` : docPdfObjectUrl;
 
-    /** Save a stream entry for new classwork; best-effort so a failure never blocks the item itself. */
-    const announce = async (type: 'material' | 'assignment' | 'video', label: string, description: string) => {
+    /** The backend posts to the stream when classwork is created; reload the stream to show it. */
+    const refreshStream = async () => {
         try {
-            const post = await api.post<StreamItemResponse>(`/courses/${courseId}/stream`, {
-                type,
-                title: `${userName} posted a new ${label}:`,
-                description,
-            });
-            setStream((prev) => [mapStreamItem(post), ...prev]);
-            setStreamTotal((t) => t + 1);
+            const r = await api.get<PaginatedResponse<StreamItemResponse>>(`/courses/${courseId}/stream`, { limit: PAGE_SIZE, offset: 0 });
+            setStream((r.items || []).map(mapStreamItem));
+            setStreamTotal(r.total ?? 0);
+            setStreamOffset(0);
         } catch {
-            // ignore
+            // the item itself was saved; the stream catches up on the next load
         }
     };
 
@@ -335,7 +454,6 @@ export default function CourseDetailPage() {
     const [announcementAttachments, setAnnouncementAttachments] = useState<File[]>([]);
     const [openInviteCode, setOpenInviteCode] = useState<string | null>(null);
     const [generatingOpenCode, setGeneratingOpenCode] = useState(false);
-    const [inviteResult, setInviteResult] = useState<string | null>(null);
 
     const handlePostAnnouncement = async () => {
         if (!announcementText.trim() || isPostingAnnouncement) return;
@@ -387,9 +505,9 @@ export default function CourseDetailPage() {
         setEditItem(item || null);
         setMaterialFormError(null);
         if (item) {
-            setFormData({ ...item });
+            setFormData(type === 'assignment' ? { ...item, dueLocal: toDateTimeLocal(item.dueDate) } : { ...item });
         } else {
-            if (type === 'assignment') setFormData({ title: '', description: '', dueDate: '', points: 100, attachments: [], topic: topics[0] || '' });
+            if (type === 'assignment') setFormData({ title: '', description: '', dueLocal: '', hardDeadline: false, points: 100, attachments: [], topic: topics[0] || '' });
             if (type === 'material') setFormData({ title: '', description: '', type: 'pdf', url: '', topic: topics[0] || '' });
             if (type === 'video') setFormData({ title: '', description: '', duration: '', url: '', topic: topics[0] || '' });
             if (type === 'topic') setFormData({ title: '' });
@@ -398,10 +516,18 @@ export default function CourseDetailPage() {
 
     const handleSave = async () => {
         if (modalType === 'topic') {
-            if (formData.title && !topics.includes(formData.title)) {
-                setTopics([...topics, formData.title]);
+            const title = formData.title?.trim();
+            if (!title) {
+                toast.showToast('Enter a topic name', 'error');
+                return;
             }
-            setModalType(null);
+            try {
+                const created = await api.post<ModuleResponse>(`/courses/${courseId}/modules`, { title });
+                setModules((prev) => [...prev, created]);
+                setModalType(null);
+            } catch (e) {
+                toast.showToast(e instanceof Error ? e.message : 'Could not add topic', 'error');
+            }
             return;
         }
         if (modalType === 'material' && courseId) {
@@ -429,8 +555,7 @@ export default function CourseDetailPage() {
                 } else {
                     const created = await api.post<MaterialResponse>(`/courses/${courseId}/materials`, payload);
                     setMaterials((prev) => [mapMaterial(created), ...prev]);
-                    setMaterialsTotal((t) => t + 1);
-                    void announce('material', 'material', formData.title);
+                    void refreshStream();
                 }
                 setModalType(null);
                 setMaterialFormError(null);
@@ -442,7 +567,7 @@ export default function CourseDetailPage() {
             return;
         }
         if (modalType === 'assignment' && courseId) {
-            if (!formData.title?.trim() || !formData.dueDate) {
+            if (!formData.title?.trim() || !formData.dueLocal) {
                 toast.showToast('Title and due date are required', 'error');
                 return;
             }
@@ -451,7 +576,9 @@ export default function CourseDetailPage() {
                 const payload = {
                     title: formData.title.trim(),
                     description: formData.description?.trim() || undefined,
-                    dueDate: formData.dueDate,
+                    // Store the exact moment (with time zone) so the server can enforce a hard deadline.
+                    dueDate: new Date(formData.dueLocal).toISOString(),
+                    hardDeadline: !!formData.hardDeadline,
                     points: formData.points || 100,
                     topic,
                 };
@@ -462,7 +589,7 @@ export default function CourseDetailPage() {
                     setAssignments((prev) => prev.map((a) => (a.id === editItem.id ? mapAssignment(saved) : a)));
                 } else {
                     setAssignments((prev) => [mapAssignment(saved), ...prev]);
-                    void announce('assignment', 'assignment', saved.title);
+                    void refreshStream();
                 }
             } catch (e) {
                 toast.showToast(e instanceof Error ? e.message : 'Failed to save assignment', 'error');
@@ -481,9 +608,10 @@ export default function CourseDetailPage() {
                     description: formData.description?.trim() || undefined,
                     durationSeconds: parseDuration(formData.duration),
                     courseId: Number(courseId),
+                    topic: formData.topic && formData.topic !== 'No topic' ? formData.topic : undefined,
                 });
                 setVideos((prev) => [mapVideo(saved), ...prev]);
-                void announce('video', 'video lecture', saved.title);
+                void refreshStream();
             } catch (e) {
                 toast.showToast(e instanceof Error ? e.message : 'Failed to save video', 'error');
                 return;
@@ -492,12 +620,15 @@ export default function CourseDetailPage() {
         setModalType(null);
     };
 
-    const handleDeleteWork = async (item: { id: string; itemType: 'assignment' | 'video'; title: string }) => {
+    const handleDeleteWork = async (item: { id: string; itemType: 'assignment' | 'video' | 'quiz'; title: string }) => {
         if (!window.confirm(`Delete "${item.title}"?`)) return;
         try {
             if (item.itemType === 'assignment') {
                 await api.delete(`/courses/${courseId}/assignments/${item.id}`);
                 setAssignments((prev) => prev.filter((a) => a.id !== item.id));
+            } else if (item.itemType === 'quiz') {
+                await api.delete(`/quizzes/${item.id}`);
+                setQuizzes((prev) => prev.filter((q) => q.id !== item.id));
             } else {
                 await api.delete(`/videos/${item.id}`);
                 setVideos((prev) => prev.filter((v) => v.id !== item.id));
@@ -508,16 +639,27 @@ export default function CourseDetailPage() {
     };
 
     useEffect(() => {
+        docChatSession.current = { conversationId: '' };
         if (viewingMaterial) {
             setDocChatMessages([]);
             setDocChatInput('');
+            setDocChatFollowups([]);
+            setDocChatSending(false);
         }
     }, [viewingMaterial?.id]);
 
-    const isPdfMaterial = (m: Material) => m.type === 'pdf' || (m.url && /\.pdf$/i.test(m.url));
+    // The API returns uploaded files as "/courses/{id}/materials/{mid}/file" (members-only route);
+    // anything else is an external link. The type dropdown defaults to "pdf" even for images,
+    // so the viewer decides by the downloaded file's real content type (docMime).
+    const isUploadedMaterial = (m: Material) => /\/materials\/\d+\/file$/.test(m.url) || /\/uploads\//.test(m.url);
+    const [docMime, setDocMime] = useState('');
+    useResourceActivity('material', viewingMaterial?.id, () => Boolean(
+        docPdfObjectUrl && !docPdfLoading && !docPdfError &&
+        (docMime === 'application/pdf' || docMime.startsWith('image/')),
+    ));
 
     useEffect(() => {
-        if (!viewingMaterial || !courseId || !isPdfMaterial(viewingMaterial)) {
+        if (!viewingMaterial || !courseId || !isUploadedMaterial(viewingMaterial)) {
             setDocPdfObjectUrl((prev) => {
                 if (prev) URL.revokeObjectURL(prev);
                 return null;
@@ -526,6 +668,7 @@ export default function CourseDetailPage() {
             setDocPdfLoading(false);
             return;
         }
+        let cancelled = false;
         const url = getMaterialFileUrl(courseId, viewingMaterial.id);
         setDocPdfError(null);
         setDocPdfLoading(true);
@@ -533,28 +676,29 @@ export default function CourseDetailPage() {
             if (prev) URL.revokeObjectURL(prev);
             return null;
         });
-        const storedToken = (() => { try { return JSON.parse(localStorage.getItem('saarthi-auth') || '{}')?.state?.token ?? null; } catch { return null; } })();
         const base = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
-        fetch(url, {
+        authFetch(url, {
             credentials: 'include',
-            headers: {
-                ...(storedToken ? { 'Authorization': `Bearer ${storedToken}` } : {}),
-                ...(base.includes('ngrok') ? { 'ngrok-skip-browser-warning': '1' } : {}),
-            },
+            headers: base.includes('ngrok') ? { 'ngrok-skip-browser-warning': '1' } : {},
         })
-            .then((res) => {
+            .then(async (res) => {
                 if (!res.ok) throw new Error(res.status === 401 || res.status === 403 ? 'Please sign in again to view this file.' : `Could not load file (${res.status}).`);
-                return res.blob();
+                return { blob: await res.blob(), version: res.headers.get('X-Document-Version') };
             })
-            .then((blob) => {
+            .then(({ blob, version }) => {
+                if (cancelled) return;
+                setDocMime(blob.type);
+                setDocVersion(version);
                 setDocPdfObjectUrl(URL.createObjectURL(blob));
                 setDocPdfError(null);
             })
             .catch((e) => {
-                setDocPdfError(e instanceof Error ? e.message : 'Failed to load PDF.');
+                if (cancelled) return;
+                setDocPdfError(e instanceof Error ? e.message : 'Failed to load file.');
             })
-            .finally(() => setDocPdfLoading(false));
+            .finally(() => { if (!cancelled) setDocPdfLoading(false); });
         return () => {
+            cancelled = true;
             setDocPdfObjectUrl((prev) => {
                 if (prev) URL.revokeObjectURL(prev);
                 return null;
@@ -569,23 +713,42 @@ export default function CourseDetailPage() {
         setDocChatFollowups([]);
         setDocChatMessages((prev) => [...prev, { role: 'user', content: userContent }]);
         setDocChatSending(true);
+        const session = docChatSession.current;
         try {
-            const data = await api.post<{ response: string }>('/chat/message', {
-                message: userContent,
-                conversationHistory: docChatMessages,
-                contextMaterialTitle: viewingMaterial.title,
-                courseId: courseId ? parseInt(courseId) : undefined,
-            });
-            const raw = data.response || '';
+            let raw: string;
+            let metadata: ChatAnswerMetadata | null | undefined;
+            if (user?.role === 'student') {
+                if (!session.conversationId) {
+                    const conversation = await api.post<ConversationResponse>('/chat/conversations', {
+                        title: `Notes · ${viewingMaterial.title}`.slice(0, 255), courseId: Number(courseId),
+                    });
+                    session.conversationId = conversation.id;
+                }
+                const { assistantMessage } = await streamChat({
+                    conversationId: session.conversationId, message: userContent, courseId: Number(courseId),
+                    contextMaterialId: Number(viewingMaterial.id), answerMode: 'direct',
+                }, () => {}, () => {});
+                raw = assistantMessage.content;
+                metadata = assistantMessage.answerMetadata;
+            } else {
+                const data = await api.post<{ response: string }>('/chat/message', {
+                    message: userContent, conversationHistory: docChatMessages,
+                    contextMaterialTitle: viewingMaterial.title, courseId: Number(courseId),
+                });
+                raw = data.response || '';
+            }
+            if (docChatSession.current !== session) return;
             const followupMatch = raw.match(/FOLLOWUPS?:\s*(.+)$/im);
             const followups = followupMatch ? followupMatch[1].split('|').map((s: string) => s.trim()).filter(Boolean) : [];
             const clean = raw.replace(/CHECKPOINT\s*/gi, '').replace(/FOLLOWUPS?:.*$/im, '').trim();
             setDocChatFollowups(followups);
-            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: clean }]);
+            setDocChatMessages((prev) => [...prev, { role: 'assistant', content: clean, metadata }]);
         } catch (e) {
-            setDocChatMessages((prev: DocChatMessage[]) => [...prev, { role: 'assistant', content: (e instanceof Error ? e.message : 'Something went wrong. Please try again.') }]);
+            if (docChatSession.current === session) setDocChatMessages((prev) => [...prev, {
+                role: 'assistant', content: e instanceof Error ? e.message : 'Something went wrong. Please try again.',
+            }]);
         } finally {
-            setDocChatSending(false);
+            if (docChatSession.current === session) setDocChatSending(false);
         }
     };
 
@@ -599,7 +762,6 @@ export default function CourseDetailPage() {
         try {
             await api.delete(`/courses/${courseId}/materials/${materialToDelete.id}`);
             setMaterials((prev) => prev.filter((m) => m.id !== materialToDelete.id));
-            setMaterialsTotal((t) => Math.max(0, t - 1));
             setMaterialToDelete(null);
         } catch (e) {
             setMaterialFormError(e instanceof Error ? e.message : 'Failed to delete material.');
@@ -676,6 +838,98 @@ export default function CourseDetailPage() {
         }
     };
 
+    // ── Stream posts ──
+    const [openPostId, setOpenPostId] = useState<string | null>(null);
+
+    /** Students take the quiz; the teacher sees its questions and answers on the quiz page too. */
+    const openQuiz = (quizId: string) => {
+        if (isInstructor) {
+            toast.showToast('Students take this quiz from Classwork or Exam Practice.');
+            return;
+        }
+        navigate(`/quiz?id=${quizId}&from=course`);
+    };
+
+    /** Open what a post is about: the announcement itself, or the assignment / material / video it announces. */
+    const openStreamPost = (item: StreamItem) => {
+        if (item.type === 'assignment') {
+            const a = assignments.find((x) => x.title === item.description);
+            if (a) { setOpenAssignmentId(a.id); return; }
+        }
+        if (item.type === 'material') {
+            const id = item.attachments?.find((att) => att.materialId)?.materialId;
+            const m = materials.find((x) => (id ? x.id === id : x.title === item.description));
+            if (m) { setViewingMaterial(m); return; }
+        }
+        if (item.type === 'video') {
+            const v = videos.find((x) => x.title === item.description);
+            if (v) { navigate(`/videos/${v.id}`); return; }
+        }
+        if (item.type === 'quiz') {
+            const q = quizzes.find((x) => x.title === item.description);
+            if (q) { openQuiz(q.id); return; }
+        }
+        // Announcements, and classwork that has since been deleted, open in the post view.
+        setOpenPostId(item.id);
+    };
+
+    const renderFeedHeader = (item: StreamItem) => (
+        <div className="cd-feed-header">
+            <div className="cd-feed-icon">
+                {item.type === 'announcement' ? (
+                    <div className="cd-avatar">{item.author.charAt(0)}</div>
+                ) : (
+                    <div className="cd-icon-badge" style={{ backgroundColor: item.type === 'assignment' ? 'var(--primary)' : 'var(--gray-500)' }}>
+                        {item.type === 'assignment' && <FileText size={16} color="white" />}
+                        {item.type === 'material' && <BookOpen size={16} color="white" />}
+                        {item.type === 'video' && <Video size={16} color="white" />}
+                        {item.type === 'quiz' && <ListChecks size={16} color="white" />}
+                    </div>
+                )}
+            </div>
+            <div className="cd-feed-meta">
+                <p className="cd-feed-author">{item.type === 'announcement' ? item.author : item.title}</p>
+                <p className="cd-feed-date">{item.createdAt}</p>
+            </div>
+        </div>
+    );
+
+    const renderAttachments = (item: StreamItem) => {
+        // Material posts made before the id was stored: find the material by title.
+        const legacy: NonNullable<StreamItem['attachments']> = item.type === 'material' && !item.attachments?.length
+            ? materials.filter((m) => m.title === item.description).slice(0, 1).map((m) => ({ name: m.title, materialId: m.id }))
+            : [];
+        const atts = item.attachments?.length ? item.attachments : legacy;
+        if (atts.length === 0) return null;
+        return (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
+                {atts.map((att, i) => {
+                    const material = att.materialId ? materials.find((m) => m.id === att.materialId) : undefined;
+                    if (material) {
+                        return (
+                            <button key={i} type="button" className="cd-feed-attachment" onClick={(e) => { e.stopPropagation(); setViewingMaterial(material); }}>
+                                {isUploadedMaterial(material) && (
+                                    <AuthImage src={getMaterialFileUrl(courseId, material.id)} alt={material.title} className="cd-feed-attachment-img" />
+                                )}
+                                <span className="cd-feed-attachment-name"><Paperclip size={13} /> {material.title}</span>
+                            </button>
+                        );
+                    }
+                    if (!att.url) return null; // material since deleted
+                    // Older posts store "/uploads/x" without the API host.
+                    const href = att.url.startsWith('/') ? getUploadFullUrl(att.url) : att.url;
+                    const isImage = /\.(png|jpe?g|gif|webp)$/i.test(att.url);
+                    return (
+                        <a key={i} href={href} target="_blank" rel="noopener noreferrer" className="cd-feed-attachment" onClick={(e) => e.stopPropagation()}>
+                            {isImage && <img src={href} alt={att.name} className="cd-feed-attachment-img" loading="lazy" />}
+                            <span className="cd-feed-attachment-name"><Paperclip size={13} /> {att.name}</span>
+                        </a>
+                    );
+                })}
+            </div>
+        );
+    };
+
     // Calculate Items by Topic
     const itemsByTopic: Record<string, any[]> = {};
     topics.forEach(t => itemsByTopic[t] = []);
@@ -692,6 +946,17 @@ export default function CourseDetailPage() {
     videos.forEach(v => {
         const topic = v.topic && topics.includes(v.topic) ? v.topic : 'No topic';
         itemsByTopic[topic].push({ ...v, itemType: 'video' });
+    });
+    quizzes.forEach(q => {
+        const topic = q.topic && topics.includes(q.topic) ? q.topic : 'No topic';
+        itemsByTopic[topic].push({ ...q, itemType: 'quiz' });
+    });
+    // Content browser: show one kind of resource, or only bookmarked ones.
+    Object.keys(itemsByTopic).forEach((t) => {
+        itemsByTopic[t] = itemsByTopic[t].filter((item) =>
+            classworkFilter === 'all' ? true
+                : classworkFilter === 'bookmarked' ? !!bookmarkFor(item.itemType, item.id)
+                    : itemKind(item) === classworkFilter);
     });
 
     if (courseLoading && !course) {
@@ -716,13 +981,17 @@ export default function CourseDetailPage() {
                     <ArrowLeft size={20} />
                 </button>
                 <div className="cd-cr-tabs">
-                    {tabs.map((tab) => (
+                    {(isInstructor ? [...tabs, { id: 'review', label: 'AI review' }, { id: 'queries', label: 'Query log' }] : tabs).map((tab) => (
                         <button key={tab.id} className={`cd-cr-tab ${activeTab === tab.id ? 'active' : ''}`} onClick={() => setActiveTab(tab.id)}>
                             {tab.label}
                         </button>
                     ))}
                 </div>
             </div>
+
+            {course?.id === courseId && course.archivedAt && (
+                <p className="cd-archive-notice">Archived course. Current students can still access course materials.</p>
+            )}
 
             {/* ── Stream Tab ── */}
             {activeTab === 'stream' && (
@@ -743,6 +1012,9 @@ export default function CourseDetailPage() {
                                 <p>{courseDisplay.code}</p>
                             </div>
                         </div>
+
+                        {course?.id === courseId && <CourseSyllabus key={course.id} course={course} canEdit={isInstructor}
+                            onUpdated={(updated) => setCourse((current) => current?.id === updated.id ? updated : current)} />}
 
                         {/* Compose Post */}
                         <div className="cd-compose-card" style={isInstructor ? undefined : { display: 'none' }}>
@@ -807,51 +1079,21 @@ export default function CourseDetailPage() {
                         <div className="cd-feed">
                             {stream.map((item) => (
                                 <div key={item.id} className="cd-feed-item">
-                                    <div className="cd-feed-header">
-                                        <div className="cd-feed-icon">
-                                            {item.type === 'announcement' ? (
-                                                <div className="cd-avatar">{item.author.charAt(0)}</div>
-                                            ) : (
-                                                <div className="cd-icon-badge" style={{ backgroundColor: item.type === 'assignment' ? 'var(--primary)' : 'var(--gray-500)' }}>
-                                                    {item.type === 'assignment' && <FileText size={16} color="white" />}
-                                                    {item.type === 'material' && <BookOpen size={16} color="white" />}
-                                                    {item.type === 'video' && <Video size={16} color="white" />}
-                                                </div>
-                                            )}
+                                    {/* Clicking a post opens it: an announcement in its own view, classwork in its viewer. */}
+                                    <div
+                                        className="cd-feed-open"
+                                        role="button"
+                                        tabIndex={0}
+                                        aria-label={`Open post: ${item.type === 'announcement' ? item.description.slice(0, 60) : item.description}`}
+                                        onClick={() => openStreamPost(item)}
+                                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openStreamPost(item); } }}
+                                    >
+                                        {renderFeedHeader(item)}
+                                        <div className="cd-feed-body">
+                                            {item.type === 'announcement' && item.title && <h4>{item.title}</h4>}
+                                            <p className="cd-feed-text-clamp">{item.description}</p>
+                                            {renderAttachments(item)}
                                         </div>
-                                        <div className="cd-feed-meta">
-                                            <p className="cd-feed-author">
-                                                {item.type === 'announcement' ? item.author : item.title}
-                                            </p>
-                                            <p className="cd-feed-date">{item.createdAt}</p>
-                                        </div>
-                                    </div>
-                                    <div className="cd-feed-body">
-                                        {item.type === 'announcement' && item.title && <h4>{item.title}</h4>}
-                                        <p>{item.description}</p>
-                                        {/* Render attachments */}
-                                        {item.attachments && item.attachments.length > 0 && (
-                                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
-                                                {item.attachments.map((att, i) => (
-                                                    <a
-                                                        key={i}
-                                                        href={att.url}
-                                                        target="_blank"
-                                                        rel="noopener noreferrer"
-                                                        style={{
-                                                            display: 'flex', alignItems: 'center', gap: '0.4rem',
-                                                            background: 'var(--surface-hover)', border: '1px solid var(--border)',
-                                                            borderRadius: '0.5rem', padding: '0.35rem 0.75rem',
-                                                            fontSize: '0.82rem', color: 'var(--primary)', textDecoration: 'none',
-                                                            transition: 'background 0.15s'
-                                                        }}
-                                                    >
-                                                        <Paperclip size={13} />
-                                                        <span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{att.name}</span>
-                                                    </a>
-                                                ))}
-                                            </div>
-                                        )}
                                     </div>
                                     <div className="cd-feed-footer">
                                         {courseId && <StreamComments courseId={courseId} itemId={item.id} canModerate={isInstructor} />}
@@ -880,24 +1122,78 @@ export default function CourseDetailPage() {
                                         <button onClick={() => openModal('assignment')}><FileText size={16} /> Assignment</button>
                                         <button onClick={() => openModal('material')}><BookOpen size={16} /> Material</button>
                                         <button onClick={() => openModal('video')}><Video size={16} /> Video Lecture</button>
+                                        <button onClick={() => { setCreateMenuOpen(false); setShowQuizEditor(true); }}><ListChecks size={16} /> Quiz</button>
                                         <div className="cd-divider"></div>
                                         <button onClick={() => openModal('topic')}><Heading size={16} /> Topic</button>
                                     </div>
                                 )}
                             </div>
                         )}
-                        <button className="btn btn-outline" style={{ marginLeft: isInstructor ? '1rem' : '0' }}><FileText size={16} /> View your work</button>
+                        {!isInstructor && (
+                            <button className="btn btn-outline" onClick={() => setShowMyWork(true)}><FileText size={16} /> View your work</button>
+                        )}
+                    </div>
+
+                    <div className="cd-cw-filters" role="group" aria-label="Show only">
+                        {CLASSWORK_FILTERS.map((f) => (
+                            <button
+                                key={f.id}
+                                type="button"
+                                className={`cd-cw-filter ${classworkFilter === f.id ? 'active' : ''}`}
+                                aria-pressed={classworkFilter === f.id}
+                                onClick={() => setClassworkFilter(f.id)}
+                            >
+                                {f.id === 'bookmarked' && <Bookmark size={13} />} {f.label}
+                            </button>
+                        ))}
                     </div>
 
                     <div className="cd-topics-view">
+                        {classworkFilter !== 'all' && Object.values(itemsByTopic).every((list) => list.length === 0) && (
+                            <div className="cd-cw-empty">
+                                {classworkFilter === 'bookmarked' ? 'No bookmarks yet. Use the bookmark icon on any item to save it here.' : 'Nothing of this type in the course yet.'}
+                            </div>
+                        )}
                         {topics.concat('No topic').map(topic => {
                             const items = itemsByTopic[topic];
-                            if (!isInstructor && items.length === 0 && topic !== 'No topic') return null; // hide empty topics for students
-                            if (topic === 'No topic' && items.length === 0) return null;
+                            const moduleIndex = modules.findIndex((m) => m.title === topic);
+                            const module = modules[moduleIndex];
+                            const prerequisiteTopics = module ? modules.filter((entry) => module.prerequisiteIds?.includes(entry.id)) : [];
+                            const isEditorOpen = editingPrerequisites?.courseId === courseId && editingPrerequisites.moduleId === module?.id;
+                            const shownAsPrerequisite = module && requiredTopics.has(module.id);
+                            if (items.length === 0 && (topic === 'No topic' || classworkFilter !== 'all' || (!isInstructor && !shownAsPrerequisite))) return null;
 
                             return (
                                 <div key={topic} className="cd-topic-group">
-                                    <h2 className="cd-topic-title">{topic}</h2>
+                                    <div className="cd-topic-head">
+                                        <h2 className="cd-topic-title" id={module ? `course-topic-${module.id}` : undefined} tabIndex={module ? -1 : undefined}>{topic}</h2>
+                                        {isInstructor && module && classworkFilter === 'all' && (
+                                            <div className="cd-topic-actions">
+                                                <button type="button" className="btn-icon" title="Move up" aria-label={`Move ${topic} up`} disabled={reorderingModules || moduleIndex === 0} onClick={() => moveModule(moduleIndex, -1)}><ChevronUp size={16} /></button>
+                                                <button type="button" className="btn-icon" title="Move down" aria-label={`Move ${topic} down`} disabled={reorderingModules || moduleIndex === modules.length - 1} onClick={() => moveModule(moduleIndex, 1)}><ChevronDown size={16} /></button>
+                                                <button type="button" className="btn-icon" title="Rename" aria-label={`Rename ${topic}`} onClick={() => renameModule(module)}><Pencil size={15} /></button>
+                                                <button type="button" className="btn-icon" title="Prerequisites" aria-label={`Edit prerequisites for ${topic}`}
+                                                    aria-expanded={isEditorOpen} onClick={() => setEditingPrerequisites(isEditorOpen ? null : { courseId, moduleId: module.id })}><LinkIcon size={15} /></button>
+                                                <button type="button" className="btn-icon" title="Delete topic" aria-label={`Delete ${topic}`} onClick={() => deleteModule(module)}><Trash2 size={15} /></button>
+                                            </div>
+                                        )}
+                                    </div>
+                                    {prerequisiteTopics.length > 0 && <div className="cd-topic-prerequisites">
+                                        <span>Study first</span>
+                                        <ul aria-label={`Prerequisites for ${topic}`}>
+                                            {prerequisiteTopics.map((entry) => <li key={entry.id}>
+                                                {classworkFilter === 'all' ? <a href={`#course-topic-${entry.id}`}
+                                                    onClick={() => document.getElementById(`course-topic-${entry.id}`)?.focus()}>{entry.title}</a> : entry.title}
+                                            </li>)}
+                                        </ul>
+                                    </div>}
+                                    {module && isEditorOpen && <ModulePrerequisites key={module.id} module={module} modules={modules}
+                                        onCancel={() => setEditingPrerequisites(null)} onSave={async (prerequisiteIds) => {
+                                            const updated = await api.patch<ModuleResponse>(`/courses/${courseId}/modules/${module.id}`, { prerequisiteIds: prerequisiteIds.map(Number) });
+                                            setModules((items) => items.map((item) => item.id === updated.id ? { ...item, prerequisiteIds: updated.prerequisiteIds } : item));
+                                            setEditingPrerequisites((current) => current?.moduleId === updated.id ? null : current);
+                                            toast.showToast('Prerequisites saved');
+                                        }} />}
                                     <div className="cd-topic-items">
                                         {items.map(item => (
                                             <div key={item.id} className="cd-cw-item">
@@ -906,26 +1202,53 @@ export default function CourseDetailPage() {
                                                         {item.itemType === 'assignment' && <FileText size={18} color="white" />}
                                                         {item.itemType === 'material' && <BookOpen size={18} color="white" />}
                                                         {item.itemType === 'video' && <Video size={18} color="white" />}
+                                                        {item.itemType === 'quiz' && <ListChecks size={18} color="white" />}
                                                     </div>
-                                                    {item.itemType === 'material' ? (
-                                                        <button
-                                                            type="button"
-                                                            className="cd-cw-title cd-cw-title-link"
-                                                            onClick={() => setViewingMaterial(item)}
-                                                        >
-                                                            {item.title}
-                                                        </button>
-                                                    ) : (
-                                                        <span className="cd-cw-title">{item.title}</span>
+                                                    <button
+                                                        type="button"
+                                                        className="cd-cw-title cd-cw-title-link"
+                                                        onClick={() => {
+                                                            if (item.itemType === 'assignment') setOpenAssignmentId(item.id);
+                                                            else if (item.itemType === 'material') setViewingMaterial(item);
+                                                            else if (item.itemType === 'video') navigate(`/videos/${item.id}`);
+                                                            else openQuiz(item.id);
+                                                        }}
+                                                    >
+                                                        {item.title}
+                                                    </button>
+                                                    {item.itemType === 'material' && (item.type === 'exercise' || item.type === 'code') && (
+                                                        <span className="badge badge-info">{item.type === 'exercise' ? 'Exercise' : 'Code'}</span>
                                                     )}
                                                 </div>
                                                 <div className="cd-cw-item-right">
+                                                    {item.itemType === 'quiz' && (
+                                                        <>
+                                                            <span className="cd-cw-due">
+                                                                {item.questionCount} questions · {item.durationMinutes} min
+                                                                {!isInstructor && item.attemptCount > 0 && ` · best ${Math.round(item.bestScore ?? 0)}%`}
+                                                            </span>
+                                                            {!isInstructor && (
+                                                                <button className="btn btn-outline btn-sm" onClick={() => openQuiz(item.id)}>
+                                                                    {item.attemptCount > 0 ? 'Retake' : 'Start'}
+                                                                </button>
+                                                            )}
+                                                        </>
+                                                    )}
                                                     {item.itemType === 'assignment' && (
                                                         <>
-                                                            <span className="cd-cw-due">Due {item.dueDate}</span>
-                                                            {!isInstructor && item.status !== 'submitted' && (
-                                                                <button className="btn btn-outline btn-sm" onClick={() => setSubmitAssignmentId(item.id)}>
+                                                            <span className="cd-cw-due">Due {formatDue(item.dueDate)}</span>
+                                                            {!isInstructor && (() => {
+                                                                const st = statusLabel(item.status, item.submittedAt, item.dueDate, item.grade, item.points);
+                                                                return <span className={`cd-status cd-status-${st.tone}`}>{st.text}</span>;
+                                                            })()}
+                                                            {!isInstructor && item.status === 'pending' && !isClosed(item.dueDate, item.hardDeadline) && (
+                                                                <button className="btn btn-outline btn-sm" onClick={() => setOpenAssignmentId(item.id)}>
                                                                     Submit
+                                                                </button>
+                                                            )}
+                                                            {isInstructor && (
+                                                                <button className="btn btn-outline btn-sm" onClick={() => setOpenAssignmentId(item.id)}>
+                                                                    Grade
                                                                 </button>
                                                             )}
                                                         </>
@@ -935,6 +1258,7 @@ export default function CourseDetailPage() {
                                                             <span className="cd-cw-due">Posted {item.createdAt}</span>
                                                             {isInstructor && (
                                                                 <>
+                                                                    <MaterialIndexBadge courseId={courseId} materialId={item.id} />
                                                                     <button
                                                                         type="button"
                                                                         className="btn-icon"
@@ -957,6 +1281,21 @@ export default function CourseDetailPage() {
                                                         </>
                                                     )}
                                                     {item.itemType !== 'material' && isInstructor && <button type="button" className="btn-icon" title="Delete" onClick={() => handleDeleteWork(item)}><Trash2 size={16} /></button>}
+                                                    {(() => {
+                                                        const saved = !!bookmarkFor(item.itemType, item.id);
+                                                        return (
+                                                            <button
+                                                                type="button"
+                                                                className={`btn-icon cd-bookmark-btn ${saved ? 'saved' : ''}`}
+                                                                title={saved ? 'Remove bookmark' : 'Bookmark'}
+                                                                aria-label={saved ? `Remove bookmark: ${item.title}` : `Bookmark ${item.title}`}
+                                                                aria-pressed={saved}
+                                                                onClick={() => toggleBookmark(item)}
+                                                            >
+                                                                <Bookmark size={16} fill={saved ? 'currentColor' : 'none'} />
+                                                            </button>
+                                                        );
+                                                    })()}
                                                 </div>
                                             </div>
                                         ))}
@@ -972,18 +1311,18 @@ export default function CourseDetailPage() {
             )}
 
             {/* ── People Tab ── */}
+            {activeTab === 'review' && isInstructor && courseId && <AIReviewPanel courseId={courseId} />}
+            {activeTab === 'queries' && isInstructor && courseId && <CourseQueryLog key={courseId} courseId={courseId} />}
+
             {activeTab === 'people' && (
                 <div className="cd-people-container">
                     <div className="cd-people-section">
                         <div className="cd-people-header">
                             <h2>Classmates ({peopleTotal})</h2>
-                            {isInstructor ? (
-                                <button className="btn btn-primary btn-sm" onClick={() => { setShowInviteModal(true); setInviteResult(null); setInviteError(''); }}>
+                            {/* Students only reach this page once enrolled, so they need no join button here. */}
+                            {isInstructor && (
+                                <button className="btn btn-primary btn-sm" disabled={Boolean(course?.archivedAt)} onClick={() => { setShowInviteModal(true); setInviteError(''); }}>
                                     <Mail size={15} /> Invite Students
-                                </button>
-                            ) : (
-                                <button className="btn btn-outline btn-sm" onClick={() => { setShowJoinModal(true); setJoinError(''); setJoinSuccess(''); }}>
-                                    <LogIn size={15} /> Join with Code
                                 </button>
                             )}
                         </div>
@@ -1038,14 +1377,23 @@ export default function CourseDetailPage() {
                             {modalType === 'assignment' && (
                                 <div className="cd-modal-row">
                                     <div className="cd-modal-field">
-                                        <label>Due Date *</label>
-                                        <input className="input" type="date" value={formData.dueDate || ''} onChange={(e) => setFormData({ ...formData, dueDate: e.target.value })} />
+                                        <label>Due *</label>
+                                        <input className="input" type="datetime-local" value={formData.dueLocal || ''} onChange={(e) => setFormData({ ...formData, dueLocal: e.target.value })} />
                                     </div>
                                     <div className="cd-modal-field">
                                         <label>Points</label>
                                         <input className="input" type="number" value={formData.points || 100} onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) || 0 })} />
                                     </div>
                                 </div>
+                            )}
+                            {modalType === 'assignment' && (
+                                <label className="cd-checkbox-field">
+                                    <input type="checkbox" checked={!!formData.hardDeadline} onChange={(e) => setFormData({ ...formData, hardDeadline: e.target.checked })} />
+                                    <span>
+                                        Don't accept work after the due time
+                                        <small>Off: late work is accepted and marked late.</small>
+                                    </span>
+                                </label>
                             )}
 
                             {modalType === 'material' && (
@@ -1056,6 +1404,8 @@ export default function CourseDetailPage() {
                                             <option value="pdf">PDF</option>
                                             <option value="doc">Document</option>
                                             <option value="slide">Slides</option>
+                                            <option value="exercise">Solved exercise</option>
+                                            <option value="code">Code (MATLAB / Python)</option>
                                         </select>
                                     </div>
                                     <div className="cd-modal-field cd-modal-field-full">
@@ -1106,6 +1456,14 @@ export default function CourseDetailPage() {
                 </div>
             )}
 
+            {requestedMaterial && materialsLoadedFor === courseId && !viewingMaterial && (
+                <div className="cd-doc-view-overlay">
+                    <div className="cd-doc-view-fallback" role="alert">
+                        <p>This course material is unavailable.</p>
+                        <button type="button" className="btn btn-ghost" onClick={() => setViewingMaterial(null)}>Close</button>
+                    </div>
+                </div>
+            )}
             {/* Full-screen document view with PDF + AI sidebar (like reference) */}
             {viewingMaterial && (
                 <div className="cd-doc-view-overlay">
@@ -1116,14 +1474,18 @@ export default function CourseDetailPage() {
                                 <h1 className="cd-doc-view-title">{viewingMaterial.title}</h1>
                             </div>
                             <div className="cd-doc-view-header-actions">
-                                <a
-                                    href={getMaterialFileUrl(courseId, viewingMaterial.id)}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="btn btn-outline btn-sm"
-                                >
-                                    <ExternalLink size={16} /> Open in new tab
-                                </a>
+                                {/* The file route needs the login token, which a plain link cannot send,
+                                    so open the copy already loaded in the page instead. */}
+                                {(docPdfObjectUrl || !isUploadedMaterial(viewingMaterial)) && (
+                                    <a
+                                        href={(docMime === 'application/pdf' ? pdfPageUrl : docPdfObjectUrl) ?? viewingMaterial.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="btn btn-outline btn-sm"
+                                    >
+                                        <ExternalLink size={16} /> Open in new tab
+                                    </a>
+                                )}
                                 <button type="button" className="btn btn-ghost" onClick={() => setViewingMaterial(null)}>
                                     <X size={20} /> Close
                                 </button>
@@ -1131,29 +1493,39 @@ export default function CourseDetailPage() {
                         </header>
                         <div className="cd-doc-view-main">
                             <div className="cd-doc-view-pdf-wrap">
-                                {!isPdfMaterial(viewingMaterial) ? (
+                                {!isUploadedMaterial(viewingMaterial) ? (
                                     <div className="cd-doc-view-fallback">
-                                        <p>Preview not available.</p>
-                                        <a href={getMaterialFileUrl(courseId, viewingMaterial.id)} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">Open in new tab</a>
+                                        <p>This material is a link.</p>
+                                        <a href={viewingMaterial.url} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">Open link</a>
                                     </div>
                                 ) : docPdfLoading ? (
                                     <div className="cd-doc-view-loading">
-                                        <p>Loading PDF…</p>
+                                        <p>Loading file…</p>
                                     </div>
                                 ) : docPdfError ? (
                                     <div className="cd-doc-view-fallback">
                                         <p className="cd-doc-view-error">{docPdfError}</p>
-                                        <a href={getMaterialFileUrl(courseId, viewingMaterial.id)} target="_blank" rel="noopener noreferrer" className="btn btn-outline btn-sm">Open in new tab</a>
                                     </div>
+                                ) : docPdfObjectUrl && docMime.startsWith('image/') ? (
+                                    <img src={docPdfObjectUrl} alt={viewingMaterial.title} className="cd-doc-view-image" />
+                                ) : docPdfObjectUrl && docMime === 'application/pdf' ? (
+                                    <Suspense fallback={<p className="cd-doc-view-loading" role="status">Loading PDF viewer…</p>}>
+                                        <MaterialPdf key={`${docPdfObjectUrl}:${requestedPage}`} src={docPdfObjectUrl}
+                                            title={viewingMaterial.title} documentVersion={docVersion}
+                                            initialPage={Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1}
+                                            annotationPath={`/courses/${courseId}/materials/${viewingMaterial.id}/annotations`} />
+                                    </Suspense>
                                 ) : docPdfObjectUrl ? (
-                                    <iframe
-                                        title={viewingMaterial.title}
-                                        src={docPdfObjectUrl}
-                                        className="cd-doc-view-iframe"
-                                    />
+                                    <div className="cd-doc-view-fallback">
+                                        <p>Preview is not available for this file type.</p>
+                                        <a href={docPdfObjectUrl} download={viewingMaterial.title} className="btn btn-outline btn-sm">Download</a>
+                                    </div>
                                 ) : null}
                             </div>
                             <aside className="cd-doc-view-sidebar">
+                                {!isInstructor && <Link className="btn btn-outline btn-sm" to={`/chat?course=${courseId}&material=${viewingMaterial.id}`}>
+                                    Ask about this document in course chat
+                                </Link>}
                                 <div className="cd-doc-view-sidebar-header">
                                     <Sparkles size={18} className="cd-doc-view-sidebar-icon" />
                                     <h2 className="cd-doc-view-sidebar-title">Summary</h2>
@@ -1169,10 +1541,13 @@ export default function CourseDetailPage() {
                                         {docChatMessages.map((msg, i) => (
                                             <div key={i} className={`cd-doc-view-msg cd-doc-view-msg-${msg.role}`}>
                                                 <span className="cd-doc-view-msg-role">{msg.role === 'user' ? 'You' : 'Saarthi'}</span>
+                                                {msg.metadata?.confidence && <span className="chat-turn-badge">
+                                                    Confidence · {msg.metadata.confidence === 'ok' ? 'OK' : 'Low'}
+                                                </span>}
                                                 <div
                                                     className="cd-doc-view-msg-content"
                                                     dangerouslySetInnerHTML={{
-                                                        __html: msg.content
+                                                        __html: escapeHtml(msg.content)
                                                             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
                                                             .replace(/\*(.+?)\*/g, '<em>$1</em>')
                                                             .replace(/`(.+?)`/g, '<code>$1</code>')
@@ -1180,6 +1555,7 @@ export default function CourseDetailPage() {
                                                             .replace(/\n/g, '<br/>')
                                                     }}
                                                 />
+                                                <AnswerSources citations={msg.metadata?.citations} />
                                             </div>
                                         ))}
                                         {docChatFollowups.length > 0 && !docChatSending && (
@@ -1203,6 +1579,7 @@ export default function CourseDetailPage() {
                                             type="text"
                                             className="input cd-doc-view-input"
                                             placeholder="Ask about this document…"
+                                            aria-label="Question about this document"
                                             value={docChatInput}
                                             onChange={(e) => setDocChatInput(e.target.value)}
                                             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendDocChatMessage()}
@@ -1214,6 +1591,7 @@ export default function CourseDetailPage() {
                                             onClick={sendDocChatMessage}
                                             disabled={!docChatInput.trim() || docChatSending}
                                             title="Send"
+                                            aria-label="Send question"
                                         >
                                             <Send size={18} />
                                         </button>
@@ -1248,14 +1626,14 @@ export default function CourseDetailPage() {
                         <div className="cd-modal-body">
 
                             {/* Open Invite Code section */}
-                            <div className="cd-invite-section" style={{ background: 'var(--surface-hover)', borderRadius: '0.75rem', padding: '1rem', marginBottom: '0.25rem' }}>
+                            <div className="cd-invite-section" style={{ background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: '0.75rem', padding: '1rem', marginBottom: '0.25rem' }}>
                                 <p className="cd-invite-section-label">🔗 Open Invite Code</p>
                                 <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
                                     Generate a universal code. Anyone with it can join — share it on a board or group chat.
                                 </p>
                                 {openInviteCode ? (
                                     <div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg)', border: '2px dashed var(--primary)', borderRadius: '0.5rem', padding: '0.75rem 1rem', marginBottom: '0.5rem' }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--surface-1)', border: '2px dashed var(--primary)', borderRadius: '0.5rem', padding: '0.75rem 1rem', marginBottom: '0.5rem' }}>
                                             <code style={{ flex: 1, fontSize: '1.1rem', fontFamily: 'monospace', letterSpacing: '0.1em', color: 'var(--primary)', fontWeight: 700 }}>{openInviteCode}</code>
                                             <button className="btn btn-sm btn-outline" onClick={() => { navigator.clipboard.writeText(openInviteCode); toast.showToast('Invite code copied!'); }}>Copy</button>
                                         </div>
@@ -1399,35 +1777,89 @@ export default function CourseDetailPage() {
                 </div>
             )}
 
-            {/* Submit Assignment Modal (file upload) */}
-            {submitAssignmentId && (
-                <div className="cd-modal-overlay" onClick={() => { if (!submitting) { setSubmitAssignmentId(null); setSubmitFile(null); } }}>
-                    <div className="cd-modal animate-scale-in" onClick={(e) => e.stopPropagation()}>
-                        <div className="cd-modal-header">
-                            <h2>Submit Assignment</h2>
-                            <button className="cd-modal-close" onClick={() => { if (!submitting) { setSubmitAssignmentId(null); setSubmitFile(null); } }} disabled={submitting}><X size={20} /></button>
-                        </div>
-                        <div className="cd-modal-body">
-                            <div className="cd-modal-field">
-                                <label>Attachment (optional)</label>
-                                <FileDropzone
-                                    mode="select"
-                                    onFileSelected={(file) => setSubmitFile(file ?? null)}
-                                    onClear={() => setSubmitFile(null)}
-                                    currentFile={submitFile}
-                                    maxSizeMB={20}
-                                />
+            {/* Assignment details: instructions, the student's own work, or the teacher's grading list */}
+            {(() => {
+                const a = assignments.find((x) => x.id === openAssignmentId);
+                return a && courseId ? (
+                    <AssignmentDialog
+                        courseId={courseId}
+                        assignment={a}
+                        isInstructor={isInstructor}
+                        onClose={() => setOpenAssignmentId(null)}
+                        onWorkChanged={(changes) => setAssignments((prev) => prev.map((x) => (x.id === a.id ? { ...x, ...changes } : x)))}
+                    />
+                ) : null;
+            })()}
+
+            {showQuizEditor && courseId && (
+                <QuizEditor
+                    courseId={courseId}
+                    topics={topics}
+                    onClose={() => setShowQuizEditor(false)}
+                    onCreated={(q) => {
+                        setQuizzes((prev) => [q, ...prev]);
+                        setShowQuizEditor(false);
+                        void refreshStream();
+                    }}
+                />
+            )}
+
+            {/* A stream post opened on its own: full text, attachments and class comments */}
+            {(() => {
+                const post = stream.find((s) => s.id === openPostId);
+                return post && courseId ? (
+                    <div className="cd-modal-overlay" onClick={() => setOpenPostId(null)}>
+                        <div className="cd-modal cd-modal-wide cd-post-dialog animate-scale-in" role="dialog" aria-modal="true" aria-label="Post" onClick={(e) => e.stopPropagation()}>
+                            <div className="cd-modal-header">
+                                {renderFeedHeader(post)}
+                                <button className="cd-modal-close" onClick={() => setOpenPostId(null)} aria-label="Close"><X size={20} /></button>
+                            </div>
+                            <div className="cd-modal-body">
+                                {post.type === 'announcement' && post.title && <h3>{post.title}</h3>}
+                                <p className="cd-assignment-desc">{post.description}</p>
+                                {renderAttachments(post)}
+                                <StreamComments courseId={courseId} itemId={post.id} canModerate={isInstructor} />
                             </div>
                         </div>
+                    </div>
+                ) : null;
+            })()}
+
+            {/* Student: every assignment with its status and grade */}
+            {showMyWork && (
+                <div className="cd-modal-overlay" onClick={() => setShowMyWork(false)}>
+                    <div className="cd-modal cd-modal-wide cd-assignment-dialog animate-scale-in" role="dialog" aria-modal="true" aria-labelledby="cd-mywork-title" onClick={(e) => e.stopPropagation()}>
+                        <div className="cd-modal-header">
+                            <h2 id="cd-mywork-title"><FileText size={18} /> Your work</h2>
+                            <button className="cd-modal-close" onClick={() => setShowMyWork(false)} aria-label="Close"><X size={20} /></button>
+                        </div>
+                        <div className="cd-modal-body">
+                            {assignments.length === 0 ? (
+                                <p className="cd-assignment-meta">No assignments yet.</p>
+                            ) : (
+                                <div className="cd-grade-table">
+                                    {assignments.map((a) => {
+                                        const st = statusLabel(a.status, a.submittedAt, a.dueDate, a.grade, a.points);
+                                        return (
+                                            <button key={a.id} type="button" className="cd-grade-row cd-mywork-row" onClick={() => { setShowMyWork(false); setOpenAssignmentId(a.id); }}>
+                                                <span className="cd-grade-student">
+                                                    <span className="cd-grade-name">{a.title}</span>
+                                                    <span className="cd-assignment-meta">Due {formatDue(a.dueDate)}</span>
+                                                </span>
+                                                <span className={`cd-status cd-status-${st.tone}`}>{st.text}</span>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
                         <div className="cd-modal-footer">
-                            <button className="btn btn-outline" onClick={() => { setSubmitAssignmentId(null); setSubmitFile(null); }} disabled={submitting}>Cancel</button>
-                            <button className="btn btn-primary" onClick={handleSubmitAssignment} disabled={submitting}>
-                                {submitting ? 'Submitting…' : 'Submit'}
-                            </button>
+                            <button className="btn btn-outline" onClick={() => setShowMyWork(false)}>Close</button>
                         </div>
                     </div>
                 </div>
             )}
+
             {showSuccessModal && (
                 <div className="cd-modal-overlay" onClick={() => setShowSuccessModal(false)}>
                     <div className="cd-modal animate-scale-in" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px', textAlign: 'center' }}>

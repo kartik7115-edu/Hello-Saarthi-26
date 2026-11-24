@@ -1,7 +1,9 @@
 /**
- * API client: all requests use credentials: 'include' (cookies).
+ * API client: sends the access token as a Bearer header and renews it once on a 401.
  * Base URL: VITE_API_URL or http://localhost:8000/api
  */
+
+import { useAuthStore } from '../stores/auth.store';
 
 const getBaseUrl = () => {
   if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
@@ -11,7 +13,6 @@ const getBaseUrl = () => {
   }
   return '/api';
 };
-let refreshInFlight: Promise<boolean> | null = null;
 
 function clearPersistedAuthState() {
   if (typeof window === 'undefined') return;
@@ -23,23 +24,35 @@ function clearPersistedAuthState() {
   window.dispatchEvent(new Event('saarthi:auth-expired'));
 }
 
-export async function attemptRefresh(): Promise<boolean> {
-  if (refreshInFlight) return refreshInFlight;
-  refreshInFlight = (async () => {
-    const base = getBaseUrl();
-    const refreshUrl = `${base}/auth/refresh`;
-    const res = await fetch(refreshUrl, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-    });
-    return res.ok;
-  })();
-  try {
-    return await refreshInFlight;
-  } finally {
-    refreshInFlight = null;
+export function attemptRefresh(): Promise<boolean> {
+  return useAuthStore.getState().refreshSession();
+}
+
+function authHeaders(): Record<string, string> {
+  const token = useAuthStore.getState().token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** Run a fetch; on 401, renew the access token once and retry. Signs out if renewal fails. */
+async function fetchWithRefresh(doFetch: () => Promise<Response>): Promise<Response> {
+  let res = await doFetch();
+  if (res.status === 401) {
+    if (await attemptRefresh()) res = await doFetch();
+    if (res.status === 401) clearPersistedAuthState();
   }
+  return res;
+}
+
+/** Raw fetch with the auth header and token renewal, for non-JSON responses such as file downloads. */
+export function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  return fetchWithRefresh(() =>
+    fetch(url, { ...init, headers: { ...(init.headers as Record<string, string>), ...authHeaders() } })
+  );
+}
+
+/** Full URL of an API path such as `/progress/class/export`, for use with authFetch. */
+export function apiUrl(path: string): string {
+    return getBaseUrl() + (path.startsWith('/') ? path : '/' + path);
 }
 
 /** Turn upload path (e.g. /uploads/xxx) into full URL for storing in DB. */
@@ -63,6 +76,27 @@ export interface PaginatedResponse<T> {
   offset: number;
 }
 
+export interface MyInviteResponse {
+  id: string;
+  inviteCode: string;
+  courseId: string;
+  courseTitle: string;
+  courseCode: string;
+  instructor: string;
+  thumbnailEmoji?: string | null;
+  expiresAt: string;
+}
+
+export interface NotificationResponse {
+  id: string;
+  type: string;
+  title: string;
+  body: string;
+  link?: string | null;
+  readAt?: string | null;
+  createdAt: string;
+}
+
 export interface ProgressResponse {
   coursesEnrolled: number;
   pendingAssignments: number;
@@ -79,6 +113,8 @@ export interface CourseResponse {
   description?: string;
   thumbnailEmoji?: string;
   color?: string;
+  archivedAt?: string | null;
+  syllabusName?: string | null;
 }
 
 export interface EnrollmentWithCourseResponse {
@@ -98,9 +134,124 @@ export interface AssignmentResponse {
   points: number;
   topic?: string;
   attachments?: string;
+  hardDeadline?: boolean;
   createdAt: string;
   status?: string;
   grade?: number;
+  submittedAt?: string | null;
+  attachmentUrl?: string | null;
+}
+
+/** One enrolled student's work on an assignment (teacher view). */
+export interface SubmissionResponse {
+  userId: string;
+  studentName: string;
+  studentEmail: string;
+  status: 'pending' | 'submitted' | 'graded';
+  submittedAt?: string | null;
+  attachmentUrl?: string | null;
+  grade?: number | null;
+}
+
+export type QuizDifficulty = 'recall' | 'application' | 'analysis';
+
+export interface QuizResponse {
+  id: string;
+  courseId?: string | null;
+  title: string;
+  description?: string | null;
+  durationMinutes: number;
+  passingScore: number;
+  questionCount: number;
+  topic?: string | null;
+  attemptCount: number;
+  bestScore?: number | null;
+}
+
+export interface QuizQuestionResponse {
+  id: string;
+  questionText: string;
+  optionsJson: string;
+  correctIndex?: number | null;
+  sortOrder: number;
+  topic?: string | null;
+  difficulty: QuizDifficulty;
+  explanation?: string | null;
+}
+
+export interface QuizDetailResponse extends QuizResponse {
+  questions: QuizQuestionResponse[];
+}
+
+export interface QuizAttemptResponse {
+  id: string;
+  quizId: string;
+  score?: number | null;
+  startedAt: string;
+  submittedAt?: string | null;
+  correctCount?: number | null;
+  totalQuestions?: number | null;
+  results?: { questionId: string; selectedIndex?: number | null; correctIndex: number; isCorrect: boolean; explanation?: string | null }[] | null;
+}
+
+/** A Classwork topic (course module). */
+export interface ModuleResponse {
+  id: string;
+  courseId: string;
+  title: string;
+  sortOrder: number;
+  prerequisiteIds: string[];
+}
+
+export interface BookmarkResponse {
+  id: string;
+  courseId: string;
+  itemType: 'material' | 'video' | 'assignment' | 'quiz';
+  itemId: string;
+  title: string;
+  createdAt: string;
+}
+
+export interface CodeProblemResponse {
+  id: number;
+  title: string;
+  difficulty: string;
+  points: number;
+  description: string;
+  requirements: string[];
+  expectedOutput?: string | null;
+  hints: string[];
+  starterCode: Record<string, string>;
+  topics?: string | null;
+  sortOrder: number;
+  testCases: { input?: string | null; expectedOutput?: string | null; hidden: boolean }[];
+  /** null = practice problem every user sees. */
+  courseId?: number | null;
+  courseTitle?: string | null;
+  /** The lesson (Classwork topic) within the course. */
+  topic?: string | null;
+  /** True for the course's teacher (and admins); they also get hidden test cases in full. */
+  canEdit: boolean;
+}
+
+export interface CodeSubmitResponse {
+  id: number;
+  passed: number;
+  total: number;
+  results: { index: number; passed: boolean; hidden: boolean; input?: string | null; expectedOutput?: string | null; actualOutput?: string | null; stderr?: string | null }[];
+  createdAt: string;
+}
+
+export interface CodeSubmissionItem {
+  id: number;
+  problemId: number;
+  userId: number;
+  studentName: string;
+  language: string;
+  code: string;
+  passed: number;
+  total: number;
+  createdAt: string;
 }
 
 export interface MaterialResponse {
@@ -131,6 +282,7 @@ export interface CoursePersonResponse {
 }
 
 export interface SearchItem {
+  courseId?: string | null;
   type: string;
   id: string;
   title: string;
@@ -143,6 +295,26 @@ export interface ConversationResponse {
   title: string;
   createdAt: string;
   updatedAt: string;
+  courseId?: number | null;
+}
+
+export interface ChatCitation {
+  number?: number | null;
+  source_file: string;
+  page_number?: number | string | null;
+  course_id?: number | null;
+  material_id?: number | null;
+  video_id?: number | null;
+  start_sec?: number | null;
+}
+
+export interface ChatAnswerMetadata {
+  socratic?: 'hint' | 'reveal' | 'off';
+  confidence?: 'ok' | 'low' | null;
+  confidence_reasons?: string[];
+  reply_mode?: string | null;
+  citations?: ChatCitation[];
+  cap?: { near: boolean; over: boolean } | null;
 }
 
 export interface ChatMessageItemResponse {
@@ -150,13 +322,15 @@ export interface ChatMessageItemResponse {
   role: 'user' | 'assistant';
   content: string;
   createdAt: string;
+  /** The student's thumbs up/down on an answer. */
+  rating?: 'up' | 'down' | null;
+  courseId?: number | null;
+  topic?: string | null;
+  replyToId?: number | null;
+  answerMetadata?: ChatAnswerMetadata | null;
 }
 
-export interface ConversationDetailResponse {
-  id: string;
-  title: string;
-  createdAt: string;
-  updatedAt: string;
+export interface ConversationDetailResponse extends ConversationResponse {
   messages: ChatMessageItemResponse[];
 }
 
@@ -187,6 +361,7 @@ export interface VideoResponse {
   embedUrl?: string;
   chaptersJson?: string;
   sortOrder: number;
+  topic?: string | null;
 }
 
 export interface VideoNoteResponse {
@@ -222,45 +397,17 @@ async function request<T>(
     const q = search.toString();
     if (q) url += (url.includes('?') ? '&' : '?') + q;
   }
-  const doFetch = () => {
-    const authRaw = localStorage.getItem('saarthi-auth');
-    let token = '';
-    if (authRaw) {
-      try {
-        const authData = JSON.parse(authRaw);
-        token = authData?.state?.token || '';
-      } catch(e) {}
-    }
-    const reqHeaders = { 'Content-Type': 'application/json', ...init.headers } as Record<string, string>;
-    if (token) reqHeaders['Authorization'] = `Bearer ${token}`;
-
-    return fetch(url, {
+  const doFetch = () =>
+    fetch(url, {
       ...init,
-      headers: reqHeaders,
+      headers: { 'Content-Type': 'application/json', ...init.headers, ...authHeaders() } as Record<string, string>,
     });
-  };
 
-  let res = await doFetch();
-  if (res.status === 401) {
-    clearPersistedAuthState();
-  }
+  const res = await fetchWithRefresh(doFetch);
   // 204 No Content has no body - do not parse JSON
   if (res.status === 204) {
     if (!res.ok) throw new Error(`Request failed: ${res.status}`);
     return undefined as T;
-  }
-  if (res.status === 404) {
-    if (path.includes('/users/me/progress')) {
-      return { coursesEnrolled: 3, pendingAssignments: 2, avgQuizScorePercent: 85, studyTimeHours: 12.5, streakDays: 4 } as T;
-    }
-    if (path.includes('/courses/my/enrollments')) {
-       return { items: [
-         { id: '1', courseId: 'c1', progressPercent: 65, course: { id: 'c1', title: 'Introduction to AI', code: 'CS401', instructor: 'Dr. Turing', color: 'var(--primary)' } },
-         { id: '2', courseId: 'c2', progressPercent: 20, course: { id: 'c2', title: 'Web Development', code: 'CS201', instructor: 'Prof. Berners-Lee', color: 'var(--accent)' } }
-       ], total: 2, limit: 5, offset: 0 } as T;
-    }
-    // Generic fallback for any other 404 list views
-    return { items: [], total: 0, limit: 50, offset: 0 } as unknown as T;
   }
 
   const contentType = res.headers.get('content-type');
@@ -271,9 +418,6 @@ async function request<T>(
 
   if (!res.ok) {
     const msg = data?.error?.message ?? data?.message ?? `Request failed: ${res.status}`;
-    if (res.status === 401) {
-      clearPersistedAuthState();
-    }
     throw new Error(msg);
   }
   return data as T;
@@ -289,30 +433,36 @@ export const api = {
   patch: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
 
+  put: <T>(path: string, body: unknown) =>
+    request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
+
   delete: (path: string) => request<void>(path, { method: 'DELETE' }),
 };
+
+/** Load every page of a paginated list (the backend caps a page at 100 items). */
+export async function getAllPages<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T[]> {
+  const limit = 100;
+  const items: T[] = [];
+  for (let offset = 0; ; offset += limit) {
+    const page = await api.get<PaginatedResponse<T>>(path, { ...params, limit, offset });
+    items.push(...(page.items || []));
+    if (items.length >= page.total || (page.items || []).length < limit) return items;
+  }
+}
 
 /** Upload file (course domain); returns { url: string } for assignment attachments etc. */
 export async function uploadFile(file: File): Promise<{ url: string }> {
   const base = getBaseUrl();
   const form = new FormData();
   form.append('file', file);
-  const authRaw = localStorage.getItem('saarthi-auth');
-  let token = '';
-  if (authRaw) {
-    try {
-      const authData = JSON.parse(authRaw);
-      token = authData?.state?.token || '';
-    } catch(e) {}
-  }
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
 
-  const res = await fetch(`${base}/courses/upload`, {
-    method: 'POST',
-    headers,
-    body: form,
-  });
+  const res = await fetchWithRefresh(() =>
+    fetch(`${base}/courses/upload`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: form,
+    })
+  );
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message ?? data?.message ?? 'Upload failed');
   return data;

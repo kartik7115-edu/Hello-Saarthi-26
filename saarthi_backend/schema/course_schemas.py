@@ -2,7 +2,32 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class HighlightRectangle(BaseModel):
+    x: float = Field(ge=0, lt=1)
+    y: float = Field(ge=0, lt=1)
+    width: float = Field(gt=0, le=1)
+    height: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def within_page(self):
+        if self.x + self.width > 1.000001 or self.y + self.height > 1.000001:
+            raise ValueError("Highlight rectangles must fit inside the page.")
+        return self
+
+
+class MaterialAnnotationCreate(BaseModel):
+    documentVersion: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page: int = Field(gt=0, le=100000)
+    quote: str = Field(min_length=1, max_length=5000)
+    note: str = Field(default="", max_length=4000)
+    rectangles: list[HighlightRectangle] = Field(min_length=1, max_length=100)
+
+
+class MaterialAnnotationResponse(MaterialAnnotationCreate):
+    id: str
 
 
 # ----- Course -----
@@ -14,6 +39,8 @@ class CourseResponse(BaseModel):
     description: Optional[str] = None
     thumbnailEmoji: Optional[str] = None
     color: Optional[str] = None
+    archivedAt: str | None = None
+    syllabusName: str | None = None
 
     class Config:
         populate_by_name = True
@@ -26,6 +53,19 @@ class CourseCreate(BaseModel):
     description: Optional[str] = None
     thumbnailEmoji: Optional[str] = None
     color: Optional[str] = None
+
+
+class CourseUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1)
+    code: Optional[str] = Field(None, min_length=1)
+    instructor: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = None
+    thumbnailEmoji: Optional[str] = None
+    color: Optional[str] = None
+
+
+class CourseArchiveUpdate(BaseModel):
+    archived: bool
 
 
 # ----- Enrollment -----
@@ -54,11 +94,30 @@ class AssignmentResponse(BaseModel):
     topic: Optional[str] = None
     attachments: Optional[str] = None
     createdAt: str
+    hardDeadline: bool = False
     status: str = "pending"  # the requesting student's own submission status
     grade: Optional[float] = None
+    submittedAt: Optional[str] = None  # the requesting student's own work
+    attachmentUrl: Optional[str] = None
 
     class Config:
         populate_by_name = True
+
+
+class SubmissionResponse(BaseModel):
+    """One enrolled student's work on an assignment (teacher view)."""
+
+    userId: str
+    studentName: str
+    studentEmail: str
+    status: str  # pending (assigned) | submitted (turned in) | graded
+    submittedAt: Optional[str] = None
+    attachmentUrl: Optional[str] = None
+    grade: Optional[float] = None
+
+
+class GradeRequest(BaseModel):
+    grade: Optional[float] = Field(None, ge=0, description="Points earned; null removes the grade")
 
 
 class AssignmentCreate(BaseModel):
@@ -68,6 +127,7 @@ class AssignmentCreate(BaseModel):
     points: int = 100
     topic: Optional[str] = None
     attachments: Optional[str] = None
+    hardDeadline: bool = False
 
 
 class AssignmentUpdate(BaseModel):
@@ -77,6 +137,7 @@ class AssignmentUpdate(BaseModel):
     points: Optional[int] = None
     topic: Optional[str] = None
     attachments: Optional[str] = None
+    hardDeadline: Optional[bool] = None
 
 
 class AssignmentSubmitRequest(BaseModel):
@@ -183,6 +244,19 @@ class JoinResponse(BaseModel):
     message: str
 
 
+class MyInviteItem(BaseModel):
+    """A pending course invite addressed to the signed-in student."""
+
+    id: str
+    inviteCode: str
+    courseId: str
+    courseTitle: str
+    courseCode: str
+    instructor: str
+    thumbnailEmoji: Optional[str] = None
+    expiresAt: str
+
+
 class InviteListItem(BaseModel):
     id: str
     email: str
@@ -199,6 +273,7 @@ class SearchItem(BaseModel):
     title: str
     subtitle: Optional[str] = None
     link: str
+    courseId: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -210,3 +285,42 @@ class SearchResponse(BaseModel):
     totalCourses: int = 0
     totalMaterials: int = 0
     totalVideos: int = 0
+
+
+class ModuleResponse(BaseModel):
+    """A Classwork topic (course module)."""
+
+    id: str
+    courseId: str
+    title: str
+    sortOrder: int
+    prerequisiteIds: list[str] = Field(default_factory=list)
+
+
+class ModuleCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=128)
+
+
+class ModuleUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=128)
+    sortOrder: Optional[int] = None
+    prerequisiteIds: list[int] | None = Field(default=None, max_length=100)
+
+
+class ModuleOrderUpdate(BaseModel):
+    moduleIds: list[int] = Field(min_length=1)
+
+
+class BookmarkResponse(BaseModel):
+    id: str
+    courseId: str
+    itemType: str
+    itemId: str
+    title: str
+    createdAt: str
+
+
+class BookmarkCreate(BaseModel):
+    itemType: str = Field(..., pattern="^(material|video|assignment|quiz)$")
+    itemId: str = Field(..., min_length=1, max_length=64)
+    title: str = Field(..., min_length=1, max_length=255)

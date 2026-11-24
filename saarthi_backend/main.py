@@ -61,6 +61,7 @@ from saarthi_backend.utils.exceptions import (
 )
 from saarthi_backend.utils.logging import get_logger
 from saarthi_backend.utils.rate_limit import (
+    RATE_LIMIT_ANON_CHAT,
     RATE_LIMIT_AUTH,
     RATE_LIMIT_GENERAL,
     RATE_LIMIT_MATERIAL_FILE,
@@ -95,13 +96,28 @@ def _validate_settings_at_startup() -> None:
         )
 
 
-def _load_classroom_invites_ddl() -> list[str]:
-    sql = (_backend_dir / "migrations" / "008_classroom_invites.sql").read_text(encoding="utf-8")
+def _load_ddl(filename: str) -> list[str]:
+    """Idempotent (CREATE ... IF NOT EXISTS) migration statements, also applied at startup so a restart
+    is enough on databases where the migration runner was never run."""
+    sql = (_backend_dir / "migrations" / filename).read_text(encoding="utf-8")
     body = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
     return [s.strip() for s in body.split(";") if s.strip()]
 
 
+def _load_classroom_invites_ddl() -> list[str]:
+    return _load_ddl("008_classroom_invites.sql")
+
+
 _CLASSROOM_INVITES_DDL = _load_classroom_invites_ddl()
+# 008 = class invites, 012 = AI answer review queue (AI team; was 009 before the merge with main)
+_STARTUP_DDL = _CLASSROOM_INVITES_DDL + _load_ddl("012_answer_reviews.sql")
+_MODULES_QUIZZES_CODE_DDL = _load_ddl("011_modules_quizzes_code.sql")
+_QA_REVIEW_ACTIONS_DDL = _load_ddl("009_qa_review_actions.sql")
+_ACTIVITY_EVENTS_DDL = _load_ddl("014_activity_events.sql")
+_COURSE_CHAT_DDL = _load_ddl("015_course_chat.sql")
+_QUIZ_PRACTICE_DDL = _load_ddl("016_quiz_practice.sql")
+_RESOURCE_ANNOTATIONS_DDL = _load_ddl("017_resource_annotations.sql")
+_COURSE_MANAGEMENT_DDL = _load_ddl("018_course_management.sql")
 
 
 @asynccontextmanager
@@ -126,29 +142,35 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE saarthi_videos ADD COLUMN IF NOT EXISTS transcript_text TEXT"
             )
         )
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS saarthi_code_problems (
-                id SERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                difficulty TEXT NOT NULL DEFAULT 'medium',
-                points INTEGER NOT NULL DEFAULT 50,
-                description TEXT NOT NULL DEFAULT '',
-                requirements_json TEXT,
-                expected_output TEXT,
-                hints_json TEXT,
-                starter_code_json TEXT,
-                topics TEXT,
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )
-        """))
+        # Same as migrations/009_assignment_hard_deadline.sql; the ORM model needs this column.
+        await conn.execute(text(
+            "ALTER TABLE saarthi_assignments ADD COLUMN IF NOT EXISTS hard_deadline BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
         # Invites / class codes had an ORM model but no migration (see 008_classroom_invites.sql).
-        for stmt in _CLASSROOM_INVITES_DDL:
+        for stmt in _STARTUP_DDL:
+            await conn.execute(text(stmt))
+        # Manual QA review audit log (see 009_qa_review_actions.sql).
+        for stmt in _QA_REVIEW_ACTIONS_DDL:
+            await conn.execute(text(stmt))
+        # (see 010_qa_review_actions_edited.sql)
+        await conn.execute(text("ALTER TABLE saarthi_qa_review_actions ADD COLUMN IF NOT EXISTS edited BOOLEAN NOT NULL DEFAULT FALSE"))
+        # Quiz fields, course modules, bookmarks, code test cases and submissions (011).
+        for stmt in _MODULES_QUIZZES_CODE_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _ACTIVITY_EVENTS_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _COURSE_CHAT_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _QUIZ_PRACTICE_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _RESOURCE_ANNOTATIONS_DDL:
+            await conn.execute(text(stmt))
+        for stmt in _COURSE_MANAGEMENT_DDL:
             await conn.execute(text(stmt))
     logger.info("Column migration: saarthi_videos.transcript_text ensured")
     logger.info("Table migration: saarthi_code_problems ensured")
-    logger.info("Table migration: saarthi_classroom_invites ensured")
+    logger.info("Table migration: saarthi_classroom_invites + saarthi_answer_reviews ensured")
+    logger.info("Table migration: saarthi_qa_review_actions ensured")
     session_factory = async_sessionmaker(
         engine,
         class_=AsyncSession,
@@ -161,6 +183,9 @@ async def lifespan(app: FastAPI):
         await seed_demo_users(session)
     async with session_factory() as session:
         await seed_code_problems(session)
+    async with session_factory() as session:
+        from saarthi_backend.scripts.seed_quizzes import seed_quizzes
+        await seed_quizzes(session)
     async with session_factory() as session:
         from saarthi_backend.scripts.seed_study_guides import seed_study_guides
         await seed_study_guides(session)
@@ -189,6 +214,10 @@ async def lifespan(app: FastAPI):
     except Exception as _yt_err:
         logger.warning("YouTube auto-index startup skipped: %s", _yt_err)
 
+    # Load models and course indexes now, so the first students do not pay for it (AI_WARMUP=0 skips).
+    from src.utils.warmup import start_background_warmup
+    start_background_warmup()
+
     logger.info("Saarthi backend started: PostgreSQL ready, AI in-process (src/ graph)")
     yield
     await engine.dispose()
@@ -210,6 +239,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Document-Version"],
 )
 
 # Explicit OPTIONS handler — returns 200 for all preflight requests before any other middleware
@@ -246,6 +276,11 @@ async def rate_limit_middleware(request: Request, call_next):
     elif path == "/api/courses/upload" and request.method == "POST":
         limit, window = RATE_LIMIT_UPLOAD
         prefix = "upload"
+    elif path == "/api/chat/message" and request.method == "POST" and not (
+        request.headers.get("Authorization") or request.cookies
+    ):
+        limit, window = RATE_LIMIT_ANON_CHAT
+        prefix = "anon_chat"
     elif "/materials/" in path and path.endswith("/file") and request.method == "GET":
         limit, window = RATE_LIMIT_MATERIAL_FILE
         prefix = "file"

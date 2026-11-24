@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from saarthi_backend.dao import RefreshTokenDAO, UserDAO
 from saarthi_backend.model import User
 from saarthi_backend.schema.auth_schemas import AuthResponse, UserResponse
+from saarthi_backend.service.activity_service import record_signin
 from saarthi_backend.utils.config import get_settings
 from saarthi_backend.utils.exceptions import ValidationError
 from saarthi_backend.utils.jwt_utils import create_access_token, create_refresh_token, decode_token
@@ -16,7 +17,7 @@ from saarthi_backend.utils.password import hash_password, verify_password
 
 def _user_to_response(user: User) -> UserResponse:
     role = (user.role or "").strip().lower()
-    if role not in ("teacher", "admin"):
+    if role not in ("teacher", "admin", "qa_reviewer"):
         role = "student"
     return UserResponse(
         id=str(user.id),
@@ -42,6 +43,7 @@ async def signin(db: AsyncSession, email: str, password: str, remember_me: bool 
     refresh = create_refresh_token(str(user.id), expire_days=refresh_days)
     expires = datetime.now(timezone.utc) + timedelta(days=refresh_days)
     await RefreshTokenDAO.create(db, user.id, _hash_refresh(refresh), expires)
+    record_signin(db, user)
     await db.commit()
     return AuthResponse(
         access_token=access,
@@ -81,6 +83,7 @@ async def signup(
     settings = get_settings()
     expires = datetime.now(timezone.utc) + timedelta(days=settings.jwt_refresh_expire_days)
     await RefreshTokenDAO.create(db, user.id, _hash_refresh(refresh), expires)
+    record_signin(db, user)
     await db.commit()
     return AuthResponse(
         access_token=access,
